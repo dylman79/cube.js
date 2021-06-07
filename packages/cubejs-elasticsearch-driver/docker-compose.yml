@@ -14,3 +14,17 @@ services:
       interval: 2s
       retries: 3
       start_period: 10s
+  es-elastic-co:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.5.2
+    environment:
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true # along with the memlock settings below, disables swapping
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - 9201:9200
+    healthcheck:
+      test: curl -k -u admin:admin --silent --fail https://localhost:9200/_cluster/health || exit 1
+      timeout: 5s
+      interval: 2s
+      retries: 3
+      start_period: 10s
