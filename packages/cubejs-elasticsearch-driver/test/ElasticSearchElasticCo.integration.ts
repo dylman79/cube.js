@@ -1,16 +1,16 @@
 /* globals describe, afterAll, beforeAll, test, expect, jest, it */
-const { GenericContainer, Wait } = require('testcontainers');
-const ElasticSearchDriver = require('../driver/ElasticSearchDriver');
+import {ElasticsearchContainer, StartedElasticsearchContainer, Wait} from "testcontainers";
+import {ElasticCoDriver, ElasticSearchDriverOptions} from "../src";
 
-describe('ElasticSearchDriver OpenDistro', () => {
-  let container;
-  let elasticSearchDriver;
+describe('ElasticSearchDriver Elastic.co', () => {
+  let container: StartedElasticsearchContainer;
+  let elasticSearchDriver: ElasticCoDriver;
 
   jest.setTimeout(50000);
 
-  const version = process.env.TEST_ELASTIC_OPENDISTRO_VERSION || '1.13.1';
+  const version = process.env.TEST_ELASTIC_ELASTICCO_VERSION || '7.5.2';
 
-  const startContainer = () => new GenericContainer(`amazon/opendistro-for-elasticsearch:${version}`)
+  const startContainer = () => new ElasticsearchContainer(`docker.elastic.co/elasticsearch/elasticsearch:${version}`)
     .withEnv('discovery.type', 'single-node')
     .withEnv('bootstrap.memory_lock', 'true')
     .withEnv('ES_JAVA_OPTS', '-Xms512m -Xmx512m')
@@ -25,10 +25,10 @@ describe('ElasticSearchDriver OpenDistro', () => {
     .withWaitStrategy(Wait.forHealthCheck())
     .start();
 
-  const createDriver = (c) => {
+  const createDriver = (c: StartedElasticsearchContainer, format: string = 'json') => {
     const port = c && c.getMappedPort(9200) || 9200;
 
-    return new ElasticSearchDriver({
+    let config = {
       url: `https://localhost:${port}`,
       ssl: {
         rejectUnauthorized: false,
@@ -37,15 +37,17 @@ describe('ElasticSearchDriver OpenDistro', () => {
         username: 'admin',
         password: 'admin',
       },
-      openDistro: true,
-      queryFormat: 'json'
-    });
+      openDistro: false,
+      queryFormat: format
+    } as ElasticSearchDriverOptions;
+
+    return new ElasticCoDriver(config);
   };
 
   beforeAll(async () => {
     container = await startContainer();
     elasticSearchDriver = createDriver(container);
-    elasticSearchDriver.setLogger((msg, event) => console.log(`${msg}: ${JSON.stringify(event)}`));
+    elasticSearchDriver.setLogger((msg: string, event: string) => console.log(`${msg}: ${JSON.stringify(event)}`));
   });
 
   it('testConnection', async () => {
