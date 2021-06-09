@@ -71,7 +71,7 @@ describe('OpenDistroQuery', () => {
     });
 
     it('should return timeGroupedColumn - month', async () => {
-        const result = sut.timeGroupedColumn('second', 'test');
+        const result = sut.timeGroupedColumn('month', 'test');
         expect(result ).toBe('DATE_FORMAT(test, \'yyyy-MM-01 00:00:00.000\')');
     });
 
@@ -87,22 +87,71 @@ describe('OpenDistroQuery', () => {
     });
 
     it('should return groupByClause grouped', async () => {
+        sut.ungrouped = false;
+        sut.dimensions = [{
+            dimension: 'test',
+            selectColumns: () => {
+                return 'testing';
+            },
+            dimensionSql: () => {
+                return 'test';
+            }
+        }];
         const result = sut.groupByClause();
-        expect(result ).toBe('DATE_FORMAT(test, \'yyyy-01-01 00:00:00.000\')');
+        expect(result ).toBe(' GROUP BY test');
     });
 
     it('should return orderHashToString', async () => {
-        const result = sut.orderHashToString('test');
-        expect(result ).toBe('DATE_FORMAT(test, \'yyyy-01-01 00:00:00.000\')');
+        sut.dimensions = [{
+            dimension: 'test',
+            selectColumns: () => {
+                return 'testing';
+            },
+            dimensionSql: () => {
+                return 'test';
+            }
+        }];
+        const result = sut.orderHashToString({id: 'test', desc: 'DESC'});
+        expect(result ).toBe('test DESC');
     });
 
-    it('should return getFieldAlias', async () => {
+    it('should return null if hash is null', async () => {
+        const result = sut.orderHashToString(null);
+        expect(result ).toBeNull();
+    });
+
+    it('should return null if hash has no id', async () => {
+        const result = sut.orderHashToString({});
+        expect(result ).toBeNull();
+    });
+
+    it('should return getFieldAlias - using dimensions', async () => {
+        sut.dimensions = [{
+            dimension: 'test',
+            selectColumns: () => {
+                return 'testing';
+            },
+            dimensionSql: () => {
+                return 'test';
+            }
+        }];
         const result = sut.getFieldAlias('test');
-        expect(result ).toBe('DATE_FORMAT(test, \'yyyy-01-01 00:00:00.000\')');
+        expect(result ).toBe('test');
+    });
+
+    it('should return getFieldAlias - using measures fallback', async () => {
+        sut.measures = [{
+            expressionName: 'test',
+            aliasName: () => {
+                return 'testing';
+            }
+        }];
+        const result = sut.getFieldAlias('test');
+        expect(result ).toBe('testing');
     });
 
     it('should return escapeColumnName', async () => {
         const result = sut.escapeColumnName('test');
-        expect(result ).toBe('DATE_FORMAT(test, \'yyyy-01-01 00:00:00.000\')');
+        expect(result).toBe('test');
     });
 });

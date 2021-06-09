@@ -31,8 +31,8 @@ describe('OpenDistroDriver', () => {
 
     beforeEach(() => {
         MockedClient.mockClear();
-        client = new Client();
-        sqlClient = new Client();
+        client = new Client({});
+        sqlClient = new Client({});
 
         sut = new OpenDistroDriver({});
         // @ts-ignore

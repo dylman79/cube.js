@@ -1,6 +1,6 @@
 import {Client} from '@elastic/elasticsearch';
 import { mocked } from 'ts-jest/utils';
-import {WellFormattedQueryHandler} from '../../../src/driver/query-handlers/WellFormattedQueryHandler';
+import {WellFormattedQueryHandler} from "../../../src/driver/query-handlers/WellFormattedQueryHandler";
 
 jest.mock('@elastic/elasticsearch', () => {
     return {
@@ -22,7 +22,7 @@ describe('WellFormattedQueryHandler', () => {
 
     beforeEach(async () => {
         MockedClient.mockClear();
-        client = new Client();
+        client = new Client({});
         sut = new WellFormattedQueryHandler(client, 'json');
     });
 
@@ -53,14 +53,11 @@ describe('WellFormattedQueryHandler', () => {
         expect(client.sql.query).toHaveBeenCalledTimes(1);
     });
 
-    it('should throw if no body', async (done) => {
+    it('should throw if no body', async () => {
         jest.spyOn(client.sql, 'query').mockReturnValue({ } as any);
-        try {
-            await sut.query('test', []);
-            fail();
-        } catch (e) {
-            done();
-        }
+        await expect(sut.query('test', []))
+            .rejects
+            .toThrow('Invalid Response');
     });
 
     it('should parse results for elastic co format', async () => {

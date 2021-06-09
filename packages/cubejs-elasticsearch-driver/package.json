@@ -50,17 +50,5 @@
   },
   "publishConfig": {
     "access": "public"
-  },
-  "jest": {
-    "testEnvironment": "node",
-    "moduleFileExtensions": [
-      "ts",
-      "tsx",
-      "js"
-    ],
-    "testMatch": [
-      "**/__tests__/**/*.js?(x)",
-      "**/?(*.)+(spec|test|integration).js?(x)"
-    ]
   }
 }

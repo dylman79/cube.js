@@ -142,7 +142,7 @@ describe('ElasticCoDriver', () => {
         // @ts-ignore
         sut.config.openDistro = false;
         // @ts-ignore
-        expect(() => { sut.getQueryHandler() }).toThrow();
+        expect(() => { sut.getQueryHandler() }).toThrow('Query format not supported for elastic.co: jdbc');
     });
 
     it('should call close on client', async () => {

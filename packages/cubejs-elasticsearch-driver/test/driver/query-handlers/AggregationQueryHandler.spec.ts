@@ -1,6 +1,6 @@
 import {Client} from '@elastic/elasticsearch';
 import { mocked } from 'ts-jest/utils';
-import {AggregationQueryHandler} from '../../../src/driver/query-handlers/AggregationQueryHandler';
+import {AggregationQueryHandler} from "../../../src/driver/query-handlers/AggregationQueryHandler";
 
 jest.mock('@elastic/elasticsearch', () => {
     return {
@@ -22,7 +22,7 @@ describe('AggregationQueryHandler', () => {
 
     beforeEach(async () => {
         MockedClient.mockClear();
-        client = new Client();
+        client = new Client({});
         sut = new AggregationQueryHandler(client, 'json');
     });
 
@@ -40,16 +40,6 @@ describe('AggregationQueryHandler', () => {
         jest.spyOn(client.sql, 'query').mockReturnValue({ body: { aggregations: {}} } as any);
         await sut.query('test', []);
         expect(client.sql.query).toHaveBeenCalledTimes(1);
-    });
-
-    it('should throw if no aggregations', async (done) => {
-        jest.spyOn(client.sql, 'query').mockReturnValue({ body: { } } as any);
-        try {
-            await sut.query('test', []);
-            fail();
-        } catch (e) {
-            done();
-        }
     });
 
     it('should traverse aggregations', async () => {
