@@ -120,7 +120,7 @@ export abstract class ElasticSearchDriver extends BaseDriver {
       this.client.cat.indices({
         format: 'json'
       }).then(() => resolve())
-          .catch(() => reject())
+          .catch((e) => reject(e))
     });
   }
 
@@ -163,17 +163,18 @@ export abstract class ElasticSearchDriver extends BaseDriver {
   protected getQueryHandler(): ElasticSearchQueryHandler {
     if (this.openDistro) {
       if (this.queryFormat === 'json') {
-        return new AggregationQueryHandler(this.client, this.queryFormat);
+        return new AggregationQueryHandler(this.sqlClient, this.queryFormat);
       }
-      if (this.queryFormat === 'jdbc') {
-        return new WellFormattedQueryHandler(this.client, this.queryFormat, 'datarows', 'schema');
+      if (!this.queryFormat || this.queryFormat === 'jdbc') {
+        return new WellFormattedQueryHandler(this.sqlClient, this.queryFormat, 'datarows', 'schema');
       }
+      throw new Error(`Query format not supported for open distro: ${this.queryFormat}`);
     }
 
-    if (this.queryFormat === 'json') {
-      return new WellFormattedQueryHandler(this.client, this.queryFormat);
+    if (!this.queryFormat || this.queryFormat === 'json') {
+      return new WellFormattedQueryHandler(this.sqlClient, this.queryFormat);
     }
 
-    throw new Error("No applicable query handler");
+    throw new Error(`Query format not supported for elastic.co: ${this.queryFormat}`);
   }
 }
