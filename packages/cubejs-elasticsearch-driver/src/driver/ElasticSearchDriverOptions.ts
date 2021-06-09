@@ -1,4 +1,4 @@
-import {ClientOptions} from "@elastic/elasticsearch";
+import { ClientOptions } from '@elastic/elasticsearch';
 
 export type ElasticSearchDriverOptions = Pick<ClientOptions, 'ssl' | 'auth' | 'cloud'> & {
     url?: string;

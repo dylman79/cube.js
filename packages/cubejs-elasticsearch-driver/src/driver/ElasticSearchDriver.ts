@@ -1,16 +1,17 @@
-import { BaseDriver } from "@cubejs-backend/query-orchestrator";
-import {ElasticSearchDriverOptions} from "./ElasticSearchDriverOptions";
-import {ElasticSearchQueryFormat} from "./ElasticSearchQueryFormat";
-import {Client} from "@elastic/elasticsearch";
-import {ApiKeyAuth, BasicAuth} from "@elastic/elasticsearch/lib/pool";
-import {ElasticSearchQueryHandler} from "./ElasticSearchQueryHandler";
-import {WellFormattedQueryHandler} from "./query-handlers/WellFormattedQueryHandler";
-import {AggregationQueryHandler} from "./query-handlers/AggregationQueryHandler";
+import { BaseDriver } from '@cubejs-backend/query-orchestrator';
+import { Client } from '@elastic/elasticsearch';
+import { ApiKeyAuth, BasicAuth } from '@elastic/elasticsearch/lib/pool';
+import { ElasticSearchDriverOptions } from './ElasticSearchDriverOptions';
+import { ElasticSearchQueryFormat } from './ElasticSearchQueryFormat';
+import { ElasticSearchQueryHandler } from './ElasticSearchQueryHandler';
+import { WellFormattedQueryHandler } from './query-handlers/WellFormattedQueryHandler';
+import { AggregationQueryHandler } from './query-handlers/AggregationQueryHandler';
 
 export abstract class ElasticSearchDriver extends BaseDriver {
-
   private config?: ElasticSearchDriverOptions;
+
   private readonly client: Client;
+
   private readonly sqlClient: Client;
 
   static driverEnvVariables() {
@@ -36,7 +37,6 @@ export abstract class ElasticSearchDriver extends BaseDriver {
   }
 
   protected get auth() : BasicAuth | ApiKeyAuth | undefined {
-
     let username = process.env.CUBEJS_DB_USER;
     let password = process.env.CUBEJS_DB_PASS;
     if (this.config?.auth && 'username' in this.config?.auth) {
@@ -50,7 +50,7 @@ export abstract class ElasticSearchDriver extends BaseDriver {
       return {
         username,
         password
-      }
+      };
     }
 
     let apiKeyId = process.env.CUBEJS_DB_ELASTIC_APIKEY_ID;
@@ -60,7 +60,7 @@ export abstract class ElasticSearchDriver extends BaseDriver {
       if (typeof this.config.auth.apiKey === 'string') {
         return {
           apiKey: this.config.auth.apiKey
-        }
+        };
       }
 
       apiKeyId = this.config.auth.apiKey.id;
@@ -78,8 +78,8 @@ export abstract class ElasticSearchDriver extends BaseDriver {
 
     if (apiKey) {
       return {
-        apiKey: apiKey
-      }
+        apiKey
+      };
     }
 
     return undefined;
@@ -106,13 +106,13 @@ export abstract class ElasticSearchDriver extends BaseDriver {
     });
 
     this.sqlClient = !this.openDistro ?
-        this.client :
-        new Client({
-          node: this.openDistro ? `${this.url}/_opendistro` : this.url,
-          cloud: this.cloud,
-          auth: this.auth,
-          ssl: this.ssl
-        });
+      this.client :
+      new Client({
+        node: this.openDistro ? `${this.url}/_opendistro` : this.url,
+        cloud: this.cloud,
+        auth: this.auth,
+        ssl: this.ssl
+      });
   }
 
   async testConnection(): Promise<void> {
@@ -120,7 +120,7 @@ export abstract class ElasticSearchDriver extends BaseDriver {
       this.client.cat.indices({
         format: 'json'
       }).then(() => resolve())
-          .catch((e) => reject(e))
+        .catch((e) => reject(e));
     });
   }
 
@@ -150,12 +150,12 @@ export abstract class ElasticSearchDriver extends BaseDriver {
       }
       throw e;
     }
-  };
+  }
 
   async release() {
     await this.client.close();
 
-    if (this.sqlClient != this.client) {
+    if (this.sqlClient !== this.client) {
       await this.sqlClient.close();
     }
   }
