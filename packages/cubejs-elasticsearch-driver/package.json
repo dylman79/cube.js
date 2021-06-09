@@ -19,8 +19,8 @@
     "watch": "tsc -w",
     "lint": "eslint src/* --ext .ts",
     "lint:fix": "eslint --fix src/* --ext .ts",
-    "integration": "jest --ci ./test/*.integration.js",
-    "integration:elastic": "yarn run integration"
+    "unit": "jest --ci /*.spec.ts",
+    "integration": "jest --ci /*.integration.ts"
   },
   "files": [
     "README.md",
