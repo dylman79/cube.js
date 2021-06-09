@@ -1,4 +1,4 @@
 
-export type ElasticCoSearchQueryFormat = string | 'json';
-export type OpenDistroSearchQueryFormat = string | 'jdbc' | 'json';
-export type ElasticSearchQueryFormat = ElasticCoSearchQueryFormat | OpenDistroSearchQueryFormat;
+export type ElasticCoSearchQueryFormat = 'json';
+export type OpenDistroSearchQueryFormat = 'jdbc' | 'json';
+export type ElasticSearchQueryFormat = string | ElasticCoSearchQueryFormat | OpenDistroSearchQueryFormat;
