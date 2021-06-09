@@ -1,14 +1,22 @@
 /* eslint-disable no-undef,react/jsx-no-target-blank */
-import { Component } from 'react';
+import { Component, useEffect } from 'react';
 import '@ant-design/compatible/assets/index.css';
 import { Layout, Alert } from 'antd';
 import { fetch } from 'whatwg-fetch';
 import { RouteComponentProps, withRouter } from 'react-router';
+import styled from "styled-components";
 
 import Header from './components/Header';
 import GlobalStyles from './components/GlobalStyles';
 import { CubeLoader } from './atoms';
-import { event, setAnonymousId } from './events';
+import {
+  event,
+  setAnonymousId,
+  setTracker,
+  setTelemetry,
+  trackImpl,
+} from './events';
+import { useAppContext } from './components/AppContext';
 import './index.less';
 
 const selectedTab = (pathname) => {
@@ -19,18 +27,40 @@ const selectedTab = (pathname) => {
   }
 };
 
-type TAppState = {
+const StyledLayoutContent = styled(Layout.Content)`
+  height: 100%;
+  
+  & > div {
+    background: var(--layout-body-background);
+  }
+`
+
+export type PlaygroundContext = {
+  anonymousId: string;
+  apiUrl: string;
+  cubejsToken: string;
+  basePath: string;
+  isDocker: boolean;
+  extDbType: string | null;
+  dbType: string;
+  telemetry: boolean;
+  shouldStartConnectionWizardFlow: boolean;
+  dockerVersion: string | null;
+  livePreview?: boolean;
+};
+
+type AppState = {
   fatalError: Error | null;
-  context: any;
+  context: PlaygroundContext | null;
   showLoader: boolean;
 };
 
-class App extends Component<RouteComponentProps, TAppState> {
+class App extends Component<RouteComponentProps, AppState> {
   static getDerivedStateFromError(error) {
     return { fatalError: error };
   }
 
-  state: TAppState = {
+  state: AppState = {
     fatalError: null,
     context: null,
     showLoader: false,
@@ -52,11 +82,16 @@ class App extends Component<RouteComponentProps, TAppState> {
 
     const res = await fetch('/playground/context');
     const context = await res.json();
+
+    setTelemetry(context.telemetry);
+    setTracker(trackImpl);
     setAnonymousId(context.anonymousId, {
       coreServerVersion: context.coreServerVersion,
       projectFingerprint: context.projectFingerprint,
-      isDocker: Boolean(context.isDocker)
+      isDocker: Boolean(context.isDocker),
+      dockerVersion: context.dockerVersion,
     });
+
     this.setState({ context }, () => {
       if (context.shouldStartConnectionWizardFlow) {
         history.push('/connection');
@@ -84,14 +119,16 @@ class App extends Component<RouteComponentProps, TAppState> {
     }
 
     if (fatalError) {
-      console.log(fatalError.stack)
+      console.log(fatalError.stack);
     }
 
     return (
       <Layout>
         <GlobalStyles />
+
         <Header selectedKeys={selectedTab(location.pathname)} />
-        <Layout.Content style={{ height: '100%' }}>
+
+        <StyledLayoutContent>
           {fatalError ? (
             <Alert
               message="Error occured while rendering"
@@ -101,10 +138,28 @@ class App extends Component<RouteComponentProps, TAppState> {
           ) : (
             children
           )}
-        </Layout.Content>
+        </StyledLayoutContent>
+
+        <ContextSetter context={context} />
       </Layout>
     );
   }
+}
+
+type ContextSetterProps = {
+  context: PlaygroundContext;
+};
+
+function ContextSetter({ context }: ContextSetterProps) {
+  const { setContext } = useAppContext();
+
+  useEffect(() => {
+    if (context !== null) {
+      setContext({ playgroundContext: context });
+    }
+  }, [context]);
+
+  return null;
 }
 
 export default withRouter(App);

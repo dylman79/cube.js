@@ -20,7 +20,6 @@ use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::MemStreamWriter;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use bigdecimal::BigDecimal;
 use core::fmt;
 use datafusion::datasource::datasource::{Statistics, TableProviderFilterPushDown};
 use datafusion::datasource::TableProvider;
@@ -35,21 +34,17 @@ use datafusion::physical_plan::merge::MergeExec;
 use datafusion::physical_plan::merge_sort::MergeSortExec;
 use datafusion::physical_plan::parquet::ParquetExec;
 use datafusion::physical_plan::{
-    collect, ExecutionPlan, OptimizerHints, Partitioning, RecordBatchStream,
-    SendableRecordBatchStream,
+    collect, ExecutionPlan, OptimizerHints, Partitioning, SendableRecordBatchStream,
 };
 use itertools::Itertools;
 use log::{debug, error, trace, warn};
 use mockall::automock;
-use num::BigInt;
-use regex::Regex;
 use serde_derive::{Deserialize, Serialize};
 use std::any::Any;
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::io::Cursor;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::{instrument, Instrument};
@@ -61,7 +56,7 @@ pub trait QueryExecutor: DIService + Send + Sync {
         &self,
         plan: SerializedPlan,
         cluster: Arc<dyn Cluster>,
-    ) -> Result<DataFrame, CubeError>;
+    ) -> Result<(SchemaRef, Vec<RecordBatch>), CubeError>;
 
     async fn execute_worker_plan(
         &self,
@@ -94,7 +89,7 @@ impl QueryExecutor for QueryExecutorImpl {
         &self,
         plan: SerializedPlan,
         cluster: Arc<dyn Cluster>,
-    ) -> Result<DataFrame, CubeError> {
+    ) -> Result<(SchemaRef, Vec<RecordBatch>), CubeError> {
         let collect_span = tracing::span!(tracing::Level::TRACE, "collect_physical_plan");
         let (physical_plan, logical_plan) = self.router_plan(plan, cluster).await?;
         let split_plan = physical_plan;
@@ -132,8 +127,7 @@ impl QueryExecutor for QueryExecutorImpl {
                 &split_plan
             );
         }
-        let data_frame = tokio::task::spawn_blocking(|| batch_to_dataframe(&results?)).await??;
-        Ok(data_frame)
+        Ok((split_plan.schema().to_schema_ref(), results?))
     }
 
     #[instrument(level = "trace", skip(self, plan, remote_to_local_names))]
@@ -194,7 +188,7 @@ impl QueryExecutor for QueryExecutorImpl {
             );
         }
         // TODO: stream results as they become available.
-        let results = regroup_batches(results.unwrap(), max_batch_rows)?;
+        let results = regroup_batches(results?, max_batch_rows)?;
         Ok((worker_plan.schema().to_schema_ref(), results))
     }
 
@@ -345,6 +339,7 @@ impl CubeTable {
                     predicate.clone(),
                     batch_size,
                     1,
+                    None, // TODO: propagate limit
                 )?);
                 partition_execs.push(arc);
             }
@@ -362,6 +357,7 @@ impl CubeTable {
                     predicate.clone(),
                     batch_size,
                     1,
+                    None, // TODO: propagate limit
                 )?);
                 partition_execs.push(node);
             }
@@ -516,7 +512,7 @@ impl ExecutionPlan for CubeTableExec {
     async fn execute(
         &self,
         partition: usize,
-    ) -> Result<Pin<Box<dyn RecordBatchStream + Send>>, DataFusionError> {
+    ) -> Result<SendableRecordBatchStream, DataFusionError> {
         self.partition_execs[partition].execute(0).await
     }
 }
@@ -540,8 +536,20 @@ impl ClusterSendExec {
         input_for_optimizations: Arc<dyn ExecutionPlan>,
         use_streaming: bool,
     ) -> Self {
-        let to_multiply = union_snapshots
-            .into_iter()
+        let partitions = ClusterSendExec::execution_partitions(&union_snapshots);
+        Self {
+            schema,
+            partitions,
+            cluster,
+            serialized_plan,
+            input_for_optimizations,
+            use_streaming,
+        }
+    }
+
+    pub fn execution_partitions(snapshots: &[Vec<IndexSnapshot>]) -> Vec<Vec<IdRow<Partition>>> {
+        let to_multiply = snapshots
+            .iter()
             .map(|union| {
                 union
                     .iter()
@@ -553,14 +561,7 @@ impl ClusterSendExec {
             .into_iter()
             .multi_cartesian_product()
             .collect::<Vec<Vec<_>>>();
-        Self {
-            schema,
-            partitions,
-            cluster,
-            serialized_plan,
-            input_for_optimizations,
-            use_streaming,
-        }
+        partitions
     }
 
     pub fn with_changed_schema(
@@ -671,6 +672,7 @@ impl TableProvider for CubeTable {
         projection: &Option<Vec<usize>>,
         batch_size: usize,
         filters: &[Expr],
+        _limit: Option<usize>, // TODO: propagate limit
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let res = self.async_scan(projection, batch_size, filters)?;
         Ok(res)
@@ -697,27 +699,15 @@ macro_rules! convert_array_cast_native {
     ($V: expr, (Vec<u8>)) => {{
         $V.to_vec()
     }};
+    ($V: expr, (Decimal)) => {{
+        crate::util::decimal::Decimal::new($V)
+    }};
     ($V: expr, $T: ty) => {{
         $V as $T
     }};
 }
 
 macro_rules! convert_array {
-    ($ARRAY:expr, $NUM_ROWS:expr, $ROWS:expr, $ARRAY_TYPE: ident, Decimal, $SCALE: expr, $CUT_TRAILING_ZEROS: expr) => {{
-        let a = $ARRAY.as_any().downcast_ref::<$ARRAY_TYPE>().unwrap();
-        for i in 0..$NUM_ROWS {
-            $ROWS[i].push(if a.is_null(i) {
-                TableValue::Null
-            } else {
-                let decimal = BigDecimal::new(BigInt::from(a.value(i) as i64), $SCALE).to_string();
-                TableValue::Decimal(
-                    $CUT_TRAILING_ZEROS
-                        .replace(&decimal.to_string(), "$1$3")
-                        .to_string(),
-                )
-            });
-        }
-    }};
     ($ARRAY:expr, $NUM_ROWS:expr, $ROWS:expr, $ARRAY_TYPE: ident, $TABLE_TYPE: ident, $NATIVE: tt) => {{
         let a = $ARRAY.as_any().downcast_ref::<$ARRAY_TYPE>().unwrap();
         for i in 0..$NUM_ROWS {
@@ -754,8 +744,6 @@ pub fn batch_to_dataframe(batches: &Vec<RecordBatch>) -> Result<DataFrame, CubeE
             rows.push(Row::new(Vec::with_capacity(batch.num_columns())));
         }
 
-        let cut_trailing_zeros = Regex::new(r"^(-?\d+\.[1-9]+)([0]+)$|^(-?\d+)(\.[0]+)$").unwrap();
-
         for column_index in 0..batch.num_columns() {
             let array = batch.column(column_index);
             let num_rows = batch.num_rows();
@@ -779,8 +767,7 @@ pub fn batch_to_dataframe(batches: &Vec<RecordBatch>) -> Result<DataFrame, CubeE
                     rows,
                     Int64Decimal0Array,
                     Decimal,
-                    0,
-                    cut_trailing_zeros
+                    (Decimal)
                 ),
                 DataType::Int64Decimal(1) => convert_array!(
                     array,
@@ -788,8 +775,7 @@ pub fn batch_to_dataframe(batches: &Vec<RecordBatch>) -> Result<DataFrame, CubeE
                     rows,
                     Int64Decimal1Array,
                     Decimal,
-                    1,
-                    cut_trailing_zeros
+                    (Decimal)
                 ),
                 DataType::Int64Decimal(2) => convert_array!(
                     array,
@@ -797,8 +783,7 @@ pub fn batch_to_dataframe(batches: &Vec<RecordBatch>) -> Result<DataFrame, CubeE
                     rows,
                     Int64Decimal2Array,
                     Decimal,
-                    2,
-                    cut_trailing_zeros
+                    (Decimal)
                 ),
                 DataType::Int64Decimal(3) => convert_array!(
                     array,
@@ -806,8 +791,7 @@ pub fn batch_to_dataframe(batches: &Vec<RecordBatch>) -> Result<DataFrame, CubeE
                     rows,
                     Int64Decimal3Array,
                     Decimal,
-                    3,
-                    cut_trailing_zeros
+                    (Decimal)
                 ),
                 DataType::Int64Decimal(4) => convert_array!(
                     array,
@@ -815,8 +799,7 @@ pub fn batch_to_dataframe(batches: &Vec<RecordBatch>) -> Result<DataFrame, CubeE
                     rows,
                     Int64Decimal4Array,
                     Decimal,
-                    4,
-                    cut_trailing_zeros
+                    (Decimal)
                 ),
                 DataType::Int64Decimal(5) => convert_array!(
                     array,
@@ -824,8 +807,7 @@ pub fn batch_to_dataframe(batches: &Vec<RecordBatch>) -> Result<DataFrame, CubeE
                     rows,
                     Int64Decimal5Array,
                     Decimal,
-                    5,
-                    cut_trailing_zeros
+                    (Decimal)
                 ),
                 DataType::Int64Decimal(10) => convert_array!(
                     array,
@@ -833,8 +815,7 @@ pub fn batch_to_dataframe(batches: &Vec<RecordBatch>) -> Result<DataFrame, CubeE
                     rows,
                     Int64Decimal10Array,
                     Decimal,
-                    10,
-                    cut_trailing_zeros
+                    (Decimal)
                 ),
                 DataType::Timestamp(TimeUnit::Microsecond, None) => {
                     let a = array

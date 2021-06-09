@@ -1,38 +1,44 @@
-pub mod limits;
+use core::mem;
+use core::slice::memchr;
+use std::path::Path;
+use std::pin::Pin;
+use std::sync::Arc;
+
+use async_compression::tokio::bufread::GzipDecoder;
+use async_std::io::SeekFrom;
+use async_std::task::{Context, Poll};
+use async_trait::async_trait;
+use bigdecimal::{BigDecimal, Num};
+use futures::future::join_all;
+use futures::{Stream, StreamExt};
+use itertools::Itertools;
+use mockall::automock;
+use pin_project_lite::pin_project;
+use tokio::fs::File;
+use tokio::io::{AsyncBufRead, AsyncSeekExt, AsyncWriteExt, BufReader};
+use tokio::task::JoinHandle;
 
 use crate::config::injection::DIService;
 use crate::config::ConfigObj;
 use crate::import::limits::ConcurrencyLimits;
 use crate::metastore::table::Table;
-use crate::metastore::{is_valid_hll, IdRow};
+use crate::metastore::{is_valid_binary_hll_input, HllFlavour, IdRow};
 use crate::metastore::{Column, ColumnType, ImportFormat, MetaStore};
 use crate::remotefs::RemoteFs;
 use crate::sql::timestamp_from_string;
 use crate::store::ChunkDataStore;
 use crate::table::data::{MutRows, Rows};
 use crate::table::{Row, TableValue};
+use crate::util::decimal::Decimal;
 use crate::util::maybe_owned::MaybeOwnedStr;
 use crate::util::ordfloat::OrdF64;
 use crate::CubeError;
-use async_compression::tokio::bufread::GzipDecoder;
-use async_std::io::SeekFrom;
-use async_std::task::{Context, Poll};
-use async_trait::async_trait;
-use bigdecimal::{BigDecimal, Num};
-use core::mem;
-use core::slice::memchr;
-use futures::future::join_all;
-use futures::{Stream, StreamExt};
-use itertools::Itertools;
-use mockall::automock;
-use pin_project_lite::pin_project;
-use std::fs;
-use std::path::PathBuf;
-use std::pin::Pin;
-use std::sync::Arc;
-use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncBufRead, AsyncSeekExt, AsyncWriteExt, BufReader};
-use tokio::task::JoinHandle;
+use cubehll::HllSketch;
+use num::ToPrimitive;
+use std::convert::TryFrom;
+use tempfile::TempPath;
+
+pub mod limits;
 
 impl ImportFormat {
     async fn row_stream(
@@ -44,7 +50,7 @@ impl ImportFormat {
         match self {
             ImportFormat::CSV => {
                 let lines_stream: Pin<Box<dyn Stream<Item = Result<String, CubeError>> + Send>> =
-                    if location.contains(".csv.gz") {
+                    if location.contains(".gz") {
                         let reader = BufReader::new(GzipDecoder::new(BufReader::new(file)));
                         Box::pin(CsvLineStream::new(reader))
                     } else {
@@ -111,16 +117,21 @@ impl ImportFormat {
                                         .parse()
                                         .map(|v| TableValue::Int(v))
                                         .unwrap_or(TableValue::Null),
-                                    ColumnType::Decimal { .. } => {
-                                        BigDecimal::from_str_radix(value, 10)
-                                            .map(|d| TableValue::Decimal(d.to_string()))
-                                            .unwrap_or(TableValue::Null)
+                                    t @ ColumnType::Decimal { .. } => {
+                                        TableValue::Decimal(parse_decimal(
+                                            value,
+                                            u8::try_from(t.target_scale()).unwrap(),
+                                        )?)
                                     }
                                     ColumnType::Bytes => TableValue::Bytes(base64::decode(value)?),
+                                    ColumnType::HyperLogLog(HllFlavour::Snowflake) => {
+                                        let hll = HllSketch::read_snowflake(value)?;
+                                        TableValue::Bytes(hll.write())
+                                    }
                                     ColumnType::HyperLogLog(f) => {
+                                        assert!(f.imports_from_binary());
                                         let data = base64::decode(value)?;
-                                        is_valid_hll(&data, *f)?;
-
+                                        is_valid_binary_hll_input(&data, *f)?;
                                         TableValue::Bytes(data)
                                     }
                                     ColumnType::Timestamp => {
@@ -144,6 +155,26 @@ impl ImportFormat {
             }
         }
     }
+}
+
+pub(crate) fn parse_decimal(value: &str, scale: u8) -> Result<Decimal, CubeError> {
+    // TODO: parse into Decimal directly.
+    let bd = BigDecimal::from_str_radix(value, 10)?;
+    let raw_value = match bd
+        .with_scale(scale as i64)
+        .into_bigint_and_exponent()
+        .0
+        .to_i64()
+    {
+        Some(d) => d,
+        None => {
+            return Err(CubeError::user(format!(
+                "cannot represent '{}' with scale {} without loosing precision",
+                value, scale
+            )))
+        }
+    };
+    Ok(Decimal::new(raw_value))
 }
 
 struct CsvLineParser<'a> {
@@ -313,6 +344,7 @@ impl<R: AsyncBufRead> Stream for CsvLineStream<R> {
 #[async_trait]
 pub trait ImportService: DIService + Send + Sync {
     async fn import_table(&self, table_id: u64) -> Result<(), CubeError>;
+    async fn import_table_part(&self, table_id: u64, location: &str) -> Result<(), CubeError>;
 }
 
 crate::di_service!(MockImportService, [ImportService]);
@@ -346,65 +378,91 @@ impl ImportServiceImpl {
 
     pub async fn resolve_location(
         &self,
-        location: String,
+        location: &str,
         table_id: u64,
-        temp_files: &mut TempFiles,
-    ) -> Result<File, CubeError> {
-        let file = if location.starts_with("http") {
-            let tmp_file = temp_files.new_file(table_id);
-            let mut file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .open(tmp_file)
-                .await?;
-            let mut stream = reqwest::get(&location).await?.bytes_stream();
+        temp_dir: &Path,
+    ) -> Result<(File, Option<TempPath>), CubeError> {
+        if location.starts_with("http") {
+            let (file, path) = tempfile::Builder::new()
+                .prefix(&table_id.to_string())
+                .tempfile_in(temp_dir)?
+                .into_parts();
+            let mut file = File::from_std(file);
+            let mut stream = reqwest::get(location).await?.bytes_stream();
             while let Some(bytes) = stream.next().await {
                 file.write_all(bytes?.as_ref()).await?;
             }
             file.seek(SeekFrom::Start(0)).await?;
-            file
+            Ok((file, Some(path)))
         } else if location.starts_with("temp://") {
-            self.download_temp_file(location.clone()).await?
+            Ok((self.download_temp_file(location).await?, None))
         } else {
-            File::open(location.clone()).await?
-        };
-
-        Ok(file)
+            Ok((File::open(location.clone()).await?, None))
+        }
     }
 
-    async fn download_temp_file(&self, location: String) -> Result<File, CubeError> {
-        let to_download = location.replace("temp://", "temp-uploads/");
+    async fn download_temp_file(&self, location: &str) -> Result<File, CubeError> {
+        let to_download = ImportServiceImpl::temp_uploads_path(location);
         let local_file = self.remote_fs.download_file(&to_download).await?;
         Ok(File::open(local_file).await?)
     }
-}
 
-pub struct TempFiles {
-    temp_path: PathBuf,
-    files: Vec<PathBuf>,
-}
-
-impl TempFiles {
-    pub fn new(temp_path: PathBuf) -> Self {
-        Self {
-            temp_path,
-            files: Vec::new(),
-        }
+    fn temp_uploads_path(location: &str) -> String {
+        location.replace("temp://", "temp-uploads/")
     }
 
-    pub fn new_file(&mut self, table_id: u64) -> PathBuf {
-        let path = self.temp_path.join(format!("{}.csv", table_id));
-        self.files.push(path.clone());
-        path
-    }
-}
-
-impl Drop for TempFiles {
-    fn drop(&mut self) {
-        for f in self.files.iter() {
-            let _ = fs::remove_file(f);
+    async fn drop_temp_uploads(&self, location: &str) -> Result<(), CubeError> {
+        // TODO There also should be a process which collects orphaned uploads due to failed imports
+        if location.starts_with("temp://") {
+            self.remote_fs
+                .delete_file(&ImportServiceImpl::temp_uploads_path(location))
+                .await?;
         }
+        Ok(())
+    }
+
+    async fn do_import(
+        &self,
+        table: &IdRow<Table>,
+        format: ImportFormat,
+        location: &str,
+    ) -> Result<(), CubeError> {
+        let temp_dir = self.config_obj.data_dir().join("tmp");
+        tokio::fs::create_dir_all(temp_dir.clone()).await?;
+
+        let (file, tmp_path) = self
+            .resolve_location(location.clone(), table.get_id(), &temp_dir)
+            .await?;
+        let mut row_stream = format
+            .row_stream(
+                file,
+                location.to_string(),
+                table.get_row().get_columns().clone(),
+            )
+            .await?;
+
+        let mut ingestion = Ingestion::new(
+            self.meta_store.clone(),
+            self.chunk_store.clone(),
+            self.limits.clone(),
+            table.clone(),
+        );
+        let mut rows = MutRows::new(table.get_row().get_columns().len());
+        while let Some(row) = row_stream.next().await {
+            if let Some(row) = row? {
+                rows.add_row_heap_allocated(&row);
+                if rows.num_rows() >= self.config_obj.wal_split_threshold() as usize {
+                    let mut to_add = MutRows::new(table.get_row().get_columns().len());
+                    mem::swap(&mut rows, &mut to_add);
+                    ingestion.queue_data_frame(to_add.freeze()).await?;
+                }
+            }
+        }
+
+        mem::drop(tmp_path);
+
+        ingestion.queue_data_frame(rows.freeze()).await?;
+        ingestion.wait_completion().await
     }
 }
 
@@ -427,44 +485,44 @@ impl ImportService for ImportServiceImpl {
                 "Trying to import table without location: {:?}",
                 table
             )))?;
-        let temp_dir = self.config_obj.data_dir().join("tmp");
-        tokio::fs::create_dir_all(temp_dir.clone()).await?;
-        for location in locations.into_iter() {
-            let mut temp_files = TempFiles::new(temp_dir.clone());
-            let file = self
-                .resolve_location(location.clone(), table_id, &mut temp_files)
-                .await?;
-            let mut row_stream = format
-                .row_stream(
-                    file,
-                    location.to_string(),
-                    table.get_row().get_columns().clone(),
-                )
-                .await?;
-
-            let mut ingestion = Ingestion::new(
-                self.meta_store.clone(),
-                self.chunk_store.clone(),
-                self.limits.clone(),
-                table.clone(),
-            );
-            let mut rows = MutRows::new(table.get_row().get_columns().len());
-            while let Some(row) = row_stream.next().await {
-                if let Some(row) = row? {
-                    rows.add_row_heap_allocated(&row);
-                    if rows.num_rows() >= self.config_obj.wal_split_threshold() as usize {
-                        let mut to_add = MutRows::new(table.get_row().get_columns().len());
-                        mem::swap(&mut rows, &mut to_add);
-                        ingestion.queue_data_frame(to_add.freeze()).await?;
-                    }
-                }
-            }
-
-            mem::drop(temp_files);
-
-            ingestion.queue_data_frame(rows.freeze()).await?;
-            ingestion.wait_completion().await?;
+        for location in locations.iter() {
+            self.do_import(&table, *format, location).await?;
         }
+
+        for location in locations.iter() {
+            self.drop_temp_uploads(location).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn import_table_part(&self, table_id: u64, location: &str) -> Result<(), CubeError> {
+        let table = self.meta_store.get_table_by_id(table_id).await?;
+        let format = table
+            .get_row()
+            .import_format()
+            .as_ref()
+            .ok_or(CubeError::internal(format!(
+                "Trying to import table without import format: {:?}",
+                table
+            )))?;
+        let locations = table
+            .get_row()
+            .locations()
+            .ok_or(CubeError::internal(format!(
+                "Trying to import table without location: {:?}",
+                table
+            )))?;
+
+        if locations.iter().find(|l| **l == location).is_none() {
+            return Err(CubeError::internal(format!(
+                "Location not found in table spec: table = {:?}, location = {}",
+                table, location
+            )));
+        }
+        self.do_import(&table, *format, location).await?;
+
+        self.drop_temp_uploads(&location).await?;
 
         Ok(())
     }

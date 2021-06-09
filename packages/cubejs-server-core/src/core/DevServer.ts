@@ -1,5 +1,4 @@
 /* eslint-disable global-require,no-restricted-syntax */
-import type { ChildProcess } from 'child_process';
 import dotenv from '@cubejs-backend/dotenv';
 import spawn from 'cross-spawn';
 import path from 'path';
@@ -7,17 +6,24 @@ import fs from 'fs-extra';
 import { getRequestIdFromRequest } from '@cubejs-backend/api-gateway';
 import { LivePreviewWatcher } from '@cubejs-backend/cloud';
 import { AppContainer, DependencyTree, PackageFetcher, DevPackageFetcher } from '@cubejs-backend/templates';
-import type { Application as ExpressApplication } from 'express';
 import jwt from 'jsonwebtoken';
 import isDocker from 'is-docker';
+import type { Application as ExpressApplication } from 'express';
+import type { ChildProcess } from 'child_process';
 
 import type { BaseDriver } from '@cubejs-backend/query-orchestrator';
 
 import { CubejsServerCore, ServerCoreInitializedOptions } from './server';
+import { ExternalDbTypeFn } from './types';
 
 const repo = {
   owner: 'cube-js',
   name: 'cubejs-playground-templates'
+};
+
+type DevServerOptions = {
+  dockerVersion?: string,
+  externalDbTypeFn: ExternalDbTypeFn
 };
 
 export class DevServer {
@@ -29,6 +35,7 @@ export class DevServer {
 
   public constructor(
     protected readonly cubejsServer: CubejsServerCore,
+    protected readonly options?: DevServerOptions
   ) {
   }
 
@@ -45,6 +52,19 @@ export class DevServer {
       console.log(`🔒 Your temporary cube.js token: ${cubejsToken}`);
     }
     console.log(`🦅 Dev environment available at ${apiUrl}`);
+
+    if (
+      (
+        this.options?.externalDbTypeFn({
+          authInfo: null,
+          securityContext: null,
+          requestId: '',
+        }) || ''
+      ).toLowerCase() !== 'cubestore'
+    ) {
+      console.log('⚠️  Your pre-aggregations will be on an external database. It is recommended to use Cube Store for optimal performance"');
+    }
+
     this.cubejsServer.event('Dev Server Start');
     const serveStatic = require('serve-static');
 
@@ -66,10 +86,18 @@ export class DevServer {
         basePath: options.basePath,
         anonymousId: this.cubejsServer.anonymousId,
         coreServerVersion: this.cubejsServer.coreServerVersion,
+        dockerVersion: this.options?.dockerVersion || null,
+        extDbType: this.options?.externalDbTypeFn({
+          authInfo: null,
+          securityContext: null,
+          requestId: getRequestIdFromRequest(req),
+        }).toLowerCase() || null,
         projectFingerprint: this.cubejsServer.projectFingerprint,
         shouldStartConnectionWizardFlow: !this.cubejsServer.configFileExists(),
         livePreview: options.livePreview,
-        isDocker: isDocker()
+        isDocker: isDocker(),
+        telemetry: options.telemetry,
+        dbType: options.dbType
       });
     }));
 
@@ -380,6 +408,9 @@ export class DevServer {
         variables.CUBEJS_API_SECRET = options.apiSecret;
       }
 
+      // CUBEJS_EXTERNAL_DEFAULT will be default in next major version, let's test it with docker too
+      variables.CUBEJS_EXTERNAL_DEFAULT = 'true';
+      variables.CUBEJS_SCHEDULED_REFRESH_DEFAULT = 'true';
       variables = Object.entries(variables).map(([key, value]) => ([key, value].join('=')));
 
       const repositoryPath = path.join(process.cwd(), options.schemaPath);

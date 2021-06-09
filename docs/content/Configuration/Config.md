@@ -36,7 +36,7 @@ interface CubejsConfiguration {
   repositoryFactory: (context: RequestContext) => SchemaFileRepository;
   checkAuth: (req: ExpressRequest, authorization: string) => any;
   queryTransformer: (query: object, context: RequestContext) => object;
-  preAggregationsSchema: string | (context: RequestContext) => string;
+  preAggregationsSchema: string | ((context: RequestContext) => string);
   schemaVersion: (context: RequestContext) => string;
   scheduledRefreshTimer: boolean | number;
   scheduledRefreshTimeZones: string[],
@@ -70,18 +70,20 @@ interface CubejsConfiguration {
   },
   externalDbType: string | ((context: RequestContext) => string);
   externalDriverFactory: (context: RequestContext) => BaseDriver | Promise<BaseDriver>;
-  orchestratorOptions: {
-    redisPrefix: string;
-    queryCacheOptions: {
-      refreshKeyRenewalThreshold: number;
-      backgroundRenew: boolean;
-      queueOptions: QueueOptions;
-    }
-    preAggregationsOptions: {
-      queueOptions: QueueOptions;
-    }
-  },
+  orchestratorOptions: OrchestratorOptions | ((context: RequestContext) => OrchestratorOptions);
   allowJsDuplicatePropsInSchema: boolean;
+}
+
+interface OrchestratorOptions {
+  redisPrefix: string;
+  queryCacheOptions: {
+    refreshKeyRenewalThreshold: number;
+    backgroundRenew: boolean;
+    queueOptions: QueueOptions;
+  }
+  preAggregationsOptions: {
+    queueOptions: QueueOptions;
+  }
 }
 
 interface QueueOptions {
@@ -341,8 +343,15 @@ module.exports = {
 
 ### scheduledRefreshTimer
 
+<!-- prettier-ignore-start -->
 [[warning | Note]]
-| This is merely a refresh worker heart beat. It doesn't affect freshness of pre-aggregations or refresh keys. Setting this value to 30s doesn't mean pre-aggregatioins would be refreshed every 30s but rather checked for freshness every 30s. Please see [pre-aggregations refreshKey][ref-pre-aggregations-refresh-key] documentation on how to set refresh intervals for pre-aggregations.
+| This is merely a refresh worker heart beat. It doesn't affect freshness of
+| pre-aggregations or refresh keys. Setting this value to `30s` doesn't mean
+| pre-aggregations would be refreshed every 30 seconds but rather checked for
+| freshness every 30 seconds. Please consult the
+| [`refreshKey` documentation][ref-pre-aggregations-refresh-key] on how to set
+| refresh intervals for pre-aggregations.
+<!-- prettier-ignore-end -->
 
 Cube.js enables background refresh by default. You can specify an interval as a
 number in seconds or as a string format e.g. `30s`, `1m`. Can be also set using
@@ -403,16 +412,16 @@ necessary security contexts prior to running the scheduled refreshes.
 
 ```javascript
 module.exports = {
-  // scheduledRefreshContexts should return array of objects, which can declare authInfo
+  // scheduledRefreshContexts should return an array of `securityContext`s
   scheduledRefreshContexts: async () => [
     {
-      authInfo: {
+      securityContext: {
         myappid: 'demoappid',
         bucket: 'demo',
       },
     },
     {
-      authInfo: {
+      securityContext: {
         myappid: 'demoappid2',
         bucket: 'demo2',
       },
@@ -425,6 +434,30 @@ module.exports = {
 
 Option to extend the `RequestContext` with custom values. This method is called
 on each request. Can be async.
+
+The function should return an object which gets appended to the
+[`RequestContext`][ref-opts-req-ctx]. Make sure to register your value using
+[`contextToAppId`][ref-opts-ctx-to-appid] to use cache context for all possible
+values that your extendContext object key can have.
+
+```javascript
+module.exports = {
+  contextToAppId: (context) => `CUBEJS_APP_${context.activeOrganization}`,
+  extendContext: (req) => {
+    return { activeOrganization: req.headers.activeOrganization };
+  },
+};
+```
+
+You can use the custom value from extend context in your data schema like this:
+
+```javascript
+const { activeOrganization } = COMPILE_CONTEXT;
+
+cube(`Users`, {
+  sql: `SELECT * FROM users where organization_id=${activeOrganization}`,
+});
+```
 
 ### compilerCacheSize
 
@@ -651,6 +684,7 @@ the additional transpiler for check duplicates.
 [ref-cube-ctx-sec-ctx]: /cube#context-variables-security-context
 [ref-multitenancy]: /multitenancy-setup
 [ref-ext-driverfactory]: #external-driver-factory
+[ref-opts-req-ctx]: #request-context
 [ref-opts-checkauth]: #options-reference-check-auth
 [ref-opts-ctx-to-appid]: #options-reference-context-to-app-id
 [ref-opts-ctx-to-datasourceid]: #options-reference-context-to-data-source-id

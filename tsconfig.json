@@ -2,10 +2,10 @@
   "extends": "./tsconfig.base.json",
   "references": [
     {
-      "path": "packages/cubejs-templates"
+      "path": "packages/cubejs-backend-shared"
     },
     {
-      "path": "packages/cubejs-backend-shared"
+      "path": "packages/cubejs-templates"
     },
     {
       "path": "packages/cubejs-testing"
@@ -27,6 +27,18 @@
     },
     {
       "path": "packages/cubejs-druid-driver"
+    },
+    {
+      "path": "packages/cubejs-postgres-driver"
+    },
+    {
+      "path": "packages/cubejs-redshift-driver"
+    },
+    {
+      "path": "packages/cubejs-bigquery-driver"
+    },
+    {
+      "path": "packages/cubejs-snowflake-driver"
     },
     {
       "path": "packages/cubejs-jdbc-driver"

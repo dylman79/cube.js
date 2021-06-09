@@ -1,4 +1,5 @@
 import R from 'ramda';
+
 import { UserError } from '../compiler/UserError';
 
 export class PreAggregations {
@@ -112,15 +113,18 @@ export class PreAggregations {
 
     const tableName = this.preAggregationTableName(cube, preAggregationName, preAggregation);
     const refreshKeyQueries = this.query.preAggregationInvalidateKeyQueries(cube, preAggregation);
+
     return {
-      preAggregationsSchema: this.query.preAggregationSchema(),
+      preAggregationId: `${cube}.${preAggregationName}`,
+      timezone: this.query.options && this.query.options.timezone,
       tableName,
+      external: preAggregation.external,
+      preAggregationsSchema: this.query.preAggregationSchema(),
       loadSql: this.query.preAggregationLoadSql(cube, preAggregation, tableName),
       sql: this.query.preAggregationSql(cube, preAggregation),
       dataSource: this.query.preAggregationQueryForSqlEvaluation(cube, preAggregation).dataSource,
       invalidateKeyQueries: refreshKeyQueries.queries,
       refreshKeyRenewalThresholds: refreshKeyQueries.refreshKeyRenewalThresholds,
-      external: preAggregation.external,
       indexesSql: Object.keys(preAggregation.indexes || {}).map(
         index => {
           // @todo Dont use sqlAlias directly, we needed to move it in preAggregationTableName

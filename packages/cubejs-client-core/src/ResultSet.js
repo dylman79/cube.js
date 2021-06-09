@@ -7,7 +7,7 @@ import { extendMoment } from 'moment-range';
 
 const moment = extendMoment(Moment);
 
-const TIME_SERIES = {
+export const TIME_SERIES = {
   day: (range) => Array.from(range.by('day'))
     .map(d => d.format('YYYY-MM-DDT00:00:00.000')),
   month: (range) => Array.from(range.snapTo('month').by('month'))
@@ -210,7 +210,7 @@ class ResultSet {
     return axisValues.map(formatValue).join(delimiter || ', ');
   }
 
-  static getNormalizedPivotConfig(query, pivotConfig = null) {
+  static getNormalizedPivotConfig(query = {}, pivotConfig = null) {
     const defaultPivotConfig = {
       x: [],
       y: [],
@@ -255,7 +255,7 @@ class ResultSet {
     const dimensionFilter = (key) => allDimensions.includes(key) || key === 'measures';
 
     pivotConfig.x = pivotConfig.x.concat(
-      allDimensions.filter(d => !allIncludedDimensions.includes(d))
+      allDimensions.filter(d => !allIncludedDimensions.includes(d) && d !== 'compareDateRange')
     )
       .filter(dimensionFilter);
     pivotConfig.y = pivotConfig.y.filter(dimensionFilter);
@@ -263,6 +263,11 @@ class ResultSet {
     if (!pivotConfig.x.concat(pivotConfig.y).find(d => d === 'measures')) {
       pivotConfig.y.push('measures');
     }
+
+    if (dimensions.includes('compareDateRange') && !pivotConfig.y.concat(pivotConfig.x).includes('compareDateRange')) {
+      pivotConfig.y.unshift('compareDateRange');
+    }
+
     if (!measures.length) {
       pivotConfig.x = pivotConfig.x.filter(d => d !== 'measures');
       pivotConfig.y = pivotConfig.y.filter(d => d !== 'measures');

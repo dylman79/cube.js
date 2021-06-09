@@ -1,3 +1,4 @@
+pub mod cache;
 pub(crate) mod parser;
 
 use log::trace;
@@ -7,8 +8,8 @@ use sqlparser::ast::*;
 use sqlparser::dialect::Dialect;
 
 use crate::metastore::{
-    is_valid_hll, table::Table, HllFlavour, IdRow, ImportFormat, Index, IndexDef, MetaStoreTable,
-    RowKey, Schema, TableId,
+    is_valid_binary_hll_input, table::Table, HllFlavour, IdRow, ImportFormat, Index, IndexDef,
+    MetaStoreTable, RowKey, Schema, TableId,
 };
 use crate::table::{Row, TableValue, TimestampValue};
 use crate::CubeError;
@@ -20,23 +21,26 @@ use std::sync::Arc;
 
 use crate::queryplanner::{QueryPlan, QueryPlanner};
 
-use crate::cluster::{Cluster, JobEvent};
+use crate::cluster::{Cluster, JobEvent, JobResultListener};
 
 use crate::config::injection::DIService;
 use crate::import::limits::ConcurrencyLimits;
 use crate::import::Ingestion;
 use crate::metastore::job::JobType;
-use crate::queryplanner::query_executor::QueryExecutor;
+use crate::queryplanner::query_executor::{batch_to_dataframe, QueryExecutor};
 use crate::remotefs::RemoteFs;
+use crate::sql::cache::SqlResultCache;
 use crate::sql::parser::CubeStoreParser;
 use crate::store::ChunkDataStore;
 use crate::table::data::{MutRows, Rows, TableValueR};
+use crate::util::decimal::Decimal;
 use chrono::format::Fixed::Nanosecond3;
 use chrono::format::Item::{Fixed, Literal, Numeric, Space};
 use chrono::format::Numeric::{Day, Hour, Minute, Month, Second, Year};
 use chrono::format::Pad::Zero;
 use chrono::format::Parsed;
 use chrono::{ParseResult, Utc};
+use cubehll::HllSketch;
 use datafusion::physical_plan::datetime_expressions::string_to_timestamp_nanos;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::sql::parser::Statement as DFStatement;
@@ -44,10 +48,12 @@ use futures::future::join_all;
 use hex::FromHex;
 use itertools::Itertools;
 use parser::Statement as CubeStoreStatement;
+use rand::distributions::Uniform;
+use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
-use std::io::Write;
+use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::path::Path;
-use std::str::from_utf8_unchecked;
 use std::time::Duration;
 use tokio::time::timeout;
 use tracing::instrument;
@@ -55,13 +61,13 @@ use tracing_futures::WithSubscriber;
 
 #[async_trait]
 pub trait SqlService: DIService + Send + Sync {
-    async fn exec_query(&self, query: &str) -> Result<DataFrame, CubeError>;
+    async fn exec_query(&self, query: &str) -> Result<Arc<DataFrame>, CubeError>;
 
     async fn exec_query_with_context(
         &self,
         context: SqlQueryContext,
         query: &str,
-    ) -> Result<DataFrame, CubeError>;
+    ) -> Result<Arc<DataFrame>, CubeError>;
 
     /// Exposed only for tests. Worker plan created as if all partitions are on the same worker.
     async fn plan_query(&self, query: &str) -> Result<QueryPlans, CubeError>;
@@ -72,6 +78,8 @@ pub trait SqlService: DIService + Send + Sync {
         name: String,
         file_path: &Path,
     ) -> Result<(), CubeError>;
+
+    async fn temp_uploads_dir(&self, context: SqlQueryContext) -> Result<String, CubeError>;
 }
 
 pub struct QueryPlans {
@@ -94,6 +102,7 @@ pub struct SqlServiceImpl {
     cluster: Arc<dyn Cluster>,
     rows_per_chunk: usize,
     query_timeout: Duration,
+    cache: SqlResultCache,
 }
 
 crate::di_service!(SqlServiceImpl, [SqlService]);
@@ -120,6 +129,7 @@ impl SqlServiceImpl {
             rows_per_chunk,
             query_timeout,
             remote_fs,
+            cache: SqlResultCache::new(10000), // TODO config
         })
     }
 
@@ -162,57 +172,91 @@ impl SqlServiceImpl {
                 });
             }
         }
-        if external {
-            let listener = self.cluster.job_result_listener();
-            let table = self
+
+        if !external {
+            return self
                 .db
                 .create_table(
                     schema_name,
                     table_name,
                     columns_to_set,
-                    locations,
-                    Some(ImportFormat::CSV),
+                    None,
+                    None,
                     indexes_to_create,
+                    true,
                 )
-                .await?;
-            let import_res = listener
-                .wait_for_job_result(
+                .await;
+        }
+
+        let listener = self.cluster.job_result_listener();
+        let table = self
+            .db
+            .create_table(
+                schema_name,
+                table_name,
+                columns_to_set,
+                locations,
+                Some(ImportFormat::CSV),
+                indexes_to_create,
+                false,
+            )
+            .await?;
+
+        if let Err(e) = self.finalize_external_table(&table, listener).await {
+            if let Err(inner) = self.db.drop_table(table.get_id()).await {
+                log::error!(
+                    "Drop table ({}) after error failed: {}",
+                    table.get_id(),
+                    inner
+                );
+            }
+            return Err(e);
+        }
+        Ok(table)
+    }
+
+    async fn finalize_external_table(
+        &self,
+        table: &IdRow<Table>,
+        listener: JobResultListener,
+    ) -> Result<(), CubeError> {
+        let wait_for = table
+            .get_row()
+            .locations()
+            .unwrap()
+            .iter()
+            .map(|&l| {
+                (
                     RowKey::Table(TableId::Tables, table.get_id()),
-                    JobType::TableImport,
+                    JobType::TableImportCSV(l.clone()),
                 )
-                .await?;
-            if let JobEvent::Error(_, _, e) = import_res {
+            })
+            .collect();
+        let imports = listener.wait_for_job_results(wait_for).await?;
+        for r in imports {
+            if let JobEvent::Error(_, _, e) = r {
                 return Err(CubeError::user(format!("Create table failed: {}", e)));
             }
-
-            let mut futures = Vec::new();
-            let indexes = self.db.get_table_indexes(table.get_id()).await?;
-            let partitions = self
-                .db
-                .get_active_partitions_and_chunks_by_index_id_for_select(
-                    indexes.iter().map(|i| i.get_id()).collect(),
-                )
-                .await?;
-            for (partition, chunks) in partitions.into_iter().flatten() {
-                futures.push(self.cluster.warmup_partition(partition, chunks));
-            }
-            join_all(futures)
-                .await
-                .into_iter()
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(table)
-        } else {
-            self.db
-                .create_table(
-                    schema_name,
-                    table_name,
-                    columns_to_set,
-                    None,
-                    None,
-                    indexes_to_create,
-                )
-                .await
         }
+
+        let mut futures = Vec::new();
+        let indexes = self.db.get_table_indexes(table.get_id()).await?;
+        let partitions = self
+            .db
+            .get_active_partitions_and_chunks_by_index_id_for_select(
+                indexes.iter().map(|i| i.get_id()).collect(),
+            )
+            .await?;
+        for (partition, chunks) in partitions.into_iter().flatten() {
+            futures.push(self.cluster.warmup_partition(partition, chunks));
+        }
+        join_all(futures)
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+
+        self.db.table_ready(table.get_id(), true).await?;
+        Ok(())
     }
 
     async fn create_index(
@@ -305,7 +349,7 @@ impl Dialect for MySqlDialectWithBackTicks {
 
 #[async_trait]
 impl SqlService for SqlServiceImpl {
-    async fn exec_query(&self, q: &str) -> Result<DataFrame, CubeError> {
+    async fn exec_query(&self, q: &str) -> Result<Arc<DataFrame>, CubeError> {
         self.exec_query_with_context(SqlQueryContext::default(), q)
             .await
     }
@@ -314,39 +358,49 @@ impl SqlService for SqlServiceImpl {
     async fn exec_query_with_context(
         &self,
         _context: SqlQueryContext,
-        q: &str,
-    ) -> Result<DataFrame, CubeError> {
-        if !q.to_lowercase().starts_with("insert") {
-            trace!("Query: '{}'", q);
+        query: &str,
+    ) -> Result<Arc<DataFrame>, CubeError> {
+        if !query.to_lowercase().starts_with("insert") {
+            trace!("Query: '{}'", query);
         }
-        if let Some(data_frame) = SqlServiceImpl::handle_workbench_queries(q) {
-            return Ok(data_frame);
+        if let Some(data_frame) = SqlServiceImpl::handle_workbench_queries(query) {
+            return Ok(Arc::new(data_frame));
         }
         let ast = {
-            let replaced_quote = q.replace("\\'", "''");
+            let replaced_quote = query.replace("\\'", "''");
             let mut parser = CubeStoreParser::new(&replaced_quote)?;
             parser.parse_statement()?
         };
         // trace!("AST is: {:?}", ast);
         match ast {
             CubeStoreStatement::Statement(Statement::ShowVariable { variable }) => {
-                match variable.value.to_lowercase() {
-                    s if s == "schemas" => Ok(DataFrame::from(self.db.get_schemas().await?)),
-                    s if s == "tables" => Ok(DataFrame::from(self.db.get_tables().await?)),
-                    s if s == "chunks" => {
-                        Ok(DataFrame::from(self.db.chunks_table().all_rows().await?))
+                if variable.len() != 1 {
+                    return Err(CubeError::user(format!(
+                        "Only one variable supported in SHOW, but got {}",
+                        variable.len()
+                    )));
+                }
+                match variable[0].value.to_lowercase() {
+                    s if s == "schemas" => {
+                        Ok(Arc::new(DataFrame::from(self.db.get_schemas().await?)))
                     }
-                    s if s == "indexes" => {
-                        Ok(DataFrame::from(self.db.index_table().all_rows().await?))
+                    s if s == "tables" => {
+                        Ok(Arc::new(DataFrame::from(self.db.get_tables().await?)))
                     }
-                    s if s == "partitions" => {
-                        Ok(DataFrame::from(self.db.partition_table().all_rows().await?))
-                    }
+                    s if s == "chunks" => Ok(Arc::new(DataFrame::from(
+                        self.db.chunks_table().all_rows().await?,
+                    ))),
+                    s if s == "indexes" => Ok(Arc::new(DataFrame::from(
+                        self.db.index_table().all_rows().await?,
+                    ))),
+                    s if s == "partitions" => Ok(Arc::new(DataFrame::from(
+                        self.db.partition_table().all_rows().await?,
+                    ))),
                     x => Err(CubeError::user(format!("Unknown SHOW: {}", x))),
                 }
             }
             CubeStoreStatement::Statement(Statement::SetVariable { .. }) => {
-                Ok(DataFrame::new(vec![], vec![]))
+                Ok(Arc::new(DataFrame::new(vec![], vec![])))
             }
             CubeStoreStatement::CreateSchema {
                 schema_name,
@@ -354,7 +408,7 @@ impl SqlService for SqlServiceImpl {
             } => {
                 let name = schema_name.to_string();
                 let res = self.create_schema(name, if_not_exists).await?;
-                Ok(DataFrame::from(vec![res]))
+                Ok(Arc::new(DataFrame::from(vec![res])))
             }
             CubeStoreStatement::CreateTable {
                 create_table:
@@ -387,7 +441,7 @@ impl SqlService for SqlServiceImpl {
                         indexes,
                     )
                     .await?;
-                Ok(DataFrame::from(vec![res]))
+                Ok(Arc::new(DataFrame::from(vec![res])))
             }
             CubeStoreStatement::Statement(Statement::CreateIndex {
                 name,
@@ -423,7 +477,7 @@ impl SqlService for SqlServiceImpl {
                             .collect::<Result<Vec<_>, _>>()?,
                     )
                     .await?;
-                Ok(DataFrame::from(vec![res]))
+                Ok(Arc::new(DataFrame::from(vec![res])))
             }
             CubeStoreStatement::Statement(Statement::Drop {
                 object_type, names, ..
@@ -441,32 +495,33 @@ impl SqlService for SqlServiceImpl {
                     }
                     _ => return Err(CubeError::user("Unsupported drop operation".to_string())),
                 }
-                Ok(DataFrame::new(vec![], vec![]))
+                Ok(Arc::new(DataFrame::new(vec![], vec![])))
             }
             CubeStoreStatement::Statement(Statement::Insert {
                 table_name,
                 columns,
                 source,
+                ..
             }) => {
                 let data = if let SetExpr::Values(Values(data_series)) = &source.body {
                     data_series
                 } else {
                     return Err(CubeError::user(format!(
                         "Data should be present in query. Your query was '{}'",
-                        q
+                        query
                     )));
                 };
 
                 let nv = &table_name.0;
                 if nv.len() != 2 {
-                    return Err(CubeError::user(format!("Schema's name should be present in query (boo.table1). Your query was '{}'", q)));
+                    return Err(CubeError::user(format!("Schema's name should be present in query (boo.table1). Your query was '{}'", query)));
                 }
                 let schema_name = &nv[0].value;
                 let table_name = &nv[1].value;
 
                 self.insert_data(schema_name.clone(), table_name.clone(), &columns, data)
                     .await?;
-                Ok(DataFrame::new(vec![], vec![]))
+                Ok(Arc::new(DataFrame::new(vec![], vec![])))
             }
             CubeStoreStatement::Statement(Statement::Query(q)) => {
                 let logical_plan = self
@@ -476,13 +531,38 @@ impl SqlService for SqlServiceImpl {
                 // TODO distribute and combine
                 let res = match logical_plan {
                     QueryPlan::Meta(logical_plan) => {
-                        self.query_planner.execute_meta_plan(logical_plan).await?
+                        Arc::new(self.query_planner.execute_meta_plan(logical_plan).await?)
                     }
-                    QueryPlan::Select(serialized) => {
+                    QueryPlan::Select(serialized, partitions) => {
+                        let cluster = self.cluster.clone();
+                        let executor = self.query_executor.clone();
                         timeout(
                             self.query_timeout,
-                            self.query_executor
-                                .execute_router_plan(serialized, self.cluster.clone())
+                            self.cache
+                                .get(query, serialized, async move |plan| {
+                                    let records;
+                                    if partitions.len() == 0 {
+                                        records =
+                                            executor.execute_router_plan(plan, cluster).await?.1;
+                                    } else {
+                                        // Pick one of the workers to run as main for the request.
+                                        let i =
+                                            thread_rng().sample(Uniform::new(0, partitions.len()));
+                                        let node = cluster.node_name_by_partitions(&partitions[i]);
+                                        let rs = cluster.route_select(&node, plan).await?.1;
+                                        records = rs
+                                            .into_iter()
+                                            .map(|r| r.read())
+                                            .collect::<Result<Vec<_>, _>>()?;
+                                    }
+                                    Ok(tokio::task::spawn_blocking(
+                                        move || -> Result<DataFrame, CubeError> {
+                                            let df = batch_to_dataframe(&records)?;
+                                            Ok(df)
+                                        },
+                                    )
+                                    .await??)
+                                })
                                 .with_current_subscriber(),
                         )
                         .await??
@@ -490,7 +570,7 @@ impl SqlService for SqlServiceImpl {
                 };
                 Ok(res)
             }
-            _ => Err(CubeError::user(format!("Unsupported SQL: '{}'", q))),
+            _ => Err(CubeError::user(format!("Unsupported SQL: '{}'", query))),
         }
     }
 
@@ -507,7 +587,7 @@ impl SqlService for SqlServiceImpl {
                     .logical_plan(DFStatement::Statement(Statement::Query(q)))
                     .await?;
                 match logical_plan {
-                    QueryPlan::Select(router_plan) => {
+                    QueryPlan::Select(router_plan, _) => {
                         // For tests, pretend we have all partitions on the same worker.
                         let worker_plan = router_plan.with_partition_id_to_execute(
                             router_plan
@@ -516,11 +596,11 @@ impl SqlService for SqlServiceImpl {
                                 .flat_map(|i| i.partitions.iter().map(|p| p.partition.get_id()))
                                 .collect(),
                         );
-                        let mocked_names = worker_plan
-                            .files_to_download()
-                            .iter()
-                            .map(|f| (f.clone(), f.clone()))
-                            .collect();
+                        let mut mocked_names = HashMap::new();
+                        for f in worker_plan.files_to_download() {
+                            let name = self.remote_fs.local_file(&f).await?;
+                            mocked_names.insert(f, name);
+                        }
                         return Ok(QueryPlans {
                             router: self
                                 .query_executor
@@ -563,6 +643,10 @@ impl SqlService for SqlServiceImpl {
             .await?;
         Ok(())
     }
+
+    async fn temp_uploads_dir(&self, _context: SqlQueryContext) -> Result<String, CubeError> {
+        self.remote_fs.uploads_dir().await
+    }
 }
 
 fn convert_columns_type(columns: &Vec<ColumnDef>) -> Result<Vec<Column>, CubeError> {
@@ -577,7 +661,8 @@ fn convert_columns_type(columns: &Vec<ColumnDef>) -> Result<Vec<Column>, CubeErr
                 | DataType::Char(_)
                 | DataType::Varchar(_)
                 | DataType::Clob(_)
-                | DataType::Text => ColumnType::String,
+                | DataType::Text
+                | DataType::String => ColumnType::String,
                 DataType::Uuid
                 | DataType::Binary(_)
                 | DataType::Varbinary(_)
@@ -615,6 +700,7 @@ fn convert_columns_type(columns: &Vec<ColumnDef>) -> Result<Vec<Column>, CubeErr
                         "varbinary" => ColumnType::Bytes,
                         "hyperloglog" => ColumnType::HyperLogLog(HllFlavour::Airlift),
                         "hyperloglogpp" => ColumnType::HyperLogLog(HllFlavour::ZetaSketch),
+                        "hll_snowflake" => ColumnType::HyperLogLog(HllFlavour::Snowflake),
                         _ => {
                             return Err(CubeError::user(format!(
                                 "Custom type '{}' is not supported",
@@ -672,15 +758,32 @@ fn parse_hyper_log_log<'a>(
     v: &'a Value,
     f: HllFlavour,
 ) -> Result<&'a [u8], CubeError> {
-    let bytes = parse_binary_string(buffer, v)?;
-    is_valid_hll(bytes, f)?;
-
-    return Ok(bytes);
+    match f {
+        HllFlavour::Snowflake => {
+            let str = if let Value::SingleQuotedString(str) = v {
+                str
+            } else {
+                return Err(CubeError::user(format!(
+                    "Single quoted string is expected but {:?} found",
+                    v
+                )));
+            };
+            let hll = HllSketch::read_snowflake(str)?;
+            *buffer = hll.write();
+            Ok(buffer)
+        }
+        f => {
+            assert!(f.imports_from_binary());
+            let bytes = parse_binary_string(buffer, v)?;
+            is_valid_binary_hll_input(bytes, f)?;
+            Ok(bytes)
+        }
+    }
 }
 
 fn parse_binary_string<'a>(buffer: &'a mut Vec<u8>, v: &'a Value) -> Result<&'a [u8], CubeError> {
     match v {
-        Value::Number(s) => Ok(s.as_bytes()),
+        Value::Number(s, _) => Ok(s.as_bytes()),
         // We interpret strings of the form '0f 0a 14 ff' as a list of hex-encoded bytes.
         // MySQL will store bytes of the string itself instead and we should do the same.
         // TODO: Ensure CubeJS does not send strings of this form our way and match MySQL behavior.
@@ -732,14 +835,13 @@ fn extract_data<'a>(
             }
             ColumnType::Int => {
                 let val_int = match cell {
-                    Expr::Value(Value::Number(v)) | Expr::Value(Value::SingleQuotedString(v)) => {
-                        v.parse::<i64>()
-                    }
+                    Expr::Value(Value::Number(v, _))
+                    | Expr::Value(Value::SingleQuotedString(v)) => v.parse::<i64>(),
                     Expr::UnaryOp {
                         op: UnaryOperator::Minus,
                         expr,
                     } => {
-                        if let Expr::Value(Value::Number(v)) = expr.as_ref() {
+                        if let Expr::Value(Value::Number(v, _)) = expr.as_ref() {
                             v.parse::<i64>().map(|v| v * -1)
                         } else {
                             return Err(CubeError::user(format!(
@@ -758,11 +860,9 @@ fn extract_data<'a>(
                 }
                 TableValueR::Int(val_int.unwrap())
             }
-            ColumnType::Decimal { .. } => {
-                let decimal_val = parse_decimal(cell)?;
-                buffer.clear();
-                buffer.write_fmt(format_args!("{}", decimal_val)).unwrap();
-                TableValueR::Decimal(unsafe { from_utf8_unchecked(buffer) })
+            t @ ColumnType::Decimal { .. } => {
+                let d = parse_decimal(cell, u8::try_from(t.target_scale()).unwrap())?;
+                TableValueR::Decimal(d)
             }
             ColumnType::Bytes => {
                 let val;
@@ -805,10 +905,7 @@ fn extract_data<'a>(
                     )))
                 }
             },
-            ColumnType::Float => {
-                let decimal_val = parse_decimal(cell)?;
-                TableValueR::Float(decimal_val.into())
-            }
+            ColumnType::Float => TableValueR::Float(parse_float(cell)?.into()),
         }
     };
     Ok(res)
@@ -839,38 +936,35 @@ fn parse_time(s: &str, format: &[chrono::format::Item]) -> ParseResult<Parsed> {
     Ok(p)
 }
 
-fn parse_decimal(cell: &Expr) -> Result<f64, CubeError> {
-    let decimal_val = match cell {
-        Expr::Value(Value::Number(v)) | Expr::Value(Value::SingleQuotedString(v)) => {
-            v.parse::<f64>()
+fn parse_float(cell: &Expr) -> Result<f64, CubeError> {
+    match cell {
+        Expr::Value(Value::Number(v, _)) | Expr::Value(Value::SingleQuotedString(v)) => {
+            Ok(v.parse::<f64>()?)
         }
         Expr::UnaryOp {
             op: UnaryOperator::Minus,
-            expr,
-        } => {
-            if let Expr::Value(Value::Number(v)) = expr.as_ref() {
-                v.parse::<f64>().map(|v| v * -1.0)
-            } else {
-                return Err(CubeError::user(format!(
-                    "Can't parse decimal from, {:?}",
-                    cell
-                )));
-            }
-        }
-        _ => {
-            return Err(CubeError::user(format!(
-                "Can't parse decimal from, {:?}",
-                cell
-            )))
-        }
-    };
-    if let Err(e) = decimal_val {
-        return Err(CubeError::user(format!(
-            "Can't parse decimal from, {:?}: {}",
-            cell, e
-        )));
+            expr: box Expr::Value(Value::Number(v, _)),
+        } => Ok(-v.parse::<f64>()?),
+        _ => Err(CubeError::user(format!(
+            "Can't parse float from, {:?}",
+            cell
+        ))),
     }
-    Ok(decimal_val?)
+}
+fn parse_decimal(cell: &Expr, scale: u8) -> Result<Decimal, CubeError> {
+    match cell {
+        Expr::Value(Value::Number(v, _)) | Expr::Value(Value::SingleQuotedString(v)) => {
+            crate::import::parse_decimal(v, scale)
+        }
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr: box Expr::Value(Value::Number(v, _)),
+        } => Ok(crate::import::parse_decimal(v, scale)?.negate()),
+        _ => Err(CubeError::user(format!(
+            "Can't parse decimal from, {:?}",
+            cell
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -975,7 +1069,7 @@ mod tests {
             );
             let limits = Arc::new(ConcurrencyLimits::new(4));
             let service = SqlServiceImpl::new(
-                meta_store,
+                meta_store.clone(),
                 chunk_store,
                 limits,
                 Arc::new(MockQueryPlanner::new()),
@@ -1008,8 +1102,9 @@ mod tests {
                 TableValue::String("[{\"name\":\"PersonID\",\"column_type\":\"Int\",\"column_index\":0},{\"name\":\"LastName\",\"column_type\":\"String\",\"column_index\":1},{\"name\":\"FirstName\",\"column_type\":\"String\",\"column_index\":2},{\"name\":\"Address\",\"column_type\":\"String\",\"column_index\":3},{\"name\":\"City\",\"column_type\":\"String\",\"column_index\":4}]".to_string()),
                 TableValue::String("NULL".to_string()),
                 TableValue::String("NULL".to_string()),
-                TableValue::String("NULL".to_string()),
                 TableValue::String("false".to_string()),
+                TableValue::String("true".to_string()),
+                TableValue::String(meta_store.get_table("Foo".to_string(), "Persons".to_string()).await.unwrap().get_row().created_at().as_ref().unwrap().to_string()),
             ]));
         }
         let _ = DB::destroy(&Options::default(), path);
@@ -1042,35 +1137,35 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert_eq!(result.get_rows()[0], Row::new(vec![TableValue::Decimal("7.61".to_string()), TableValue::Decimal("59.92".to_string())]));
+            assert_eq!(result.get_rows()[0], Row::new(vec![TableValue::Decimal(Decimal::new(761000)), TableValue::Decimal(Decimal::new(5992))]));
 
             let result = service
                 .exec_query("SELECT sum(dec_value), sum(dec_value_1) from foo.values where dec_value > 10")
                 .await
                 .unwrap();
 
-            assert_eq!(result.get_rows()[0], Row::new(vec![TableValue::Decimal("160.61".to_string()), TableValue::Decimal("58.92".to_string())]));
+            assert_eq!(result.get_rows()[0], Row::new(vec![TableValue::Decimal(Decimal::new(16061000)), TableValue::Decimal(Decimal::new(5892))]));
 
             let result = service
                 .exec_query("SELECT sum(dec_value), sum(dec_value_1) / 10 from foo.values where dec_value > 10")
                 .await
                 .unwrap();
 
-            assert_eq!(result.get_rows()[0], Row::new(vec![TableValue::Decimal("160.61".to_string()), TableValue::Float(5.892.into())]));
+            assert_eq!(result.get_rows()[0], Row::new(vec![TableValue::Decimal(Decimal::new(16061000)), TableValue::Float(5.892.into())]));
 
             let result = service
                 .exec_query("SELECT sum(dec_value), sum(dec_value_1) / 10 from foo.values where dec_value_1 < 10")
                 .await
                 .unwrap();
 
-            assert_eq!(result.get_rows()[0], Row::new(vec![TableValue::Decimal("-132.99".to_string()), TableValue::Float(0.45.into())]));
+            assert_eq!(result.get_rows()[0], Row::new(vec![TableValue::Decimal(Decimal::new(-13299000)), TableValue::Float(0.45.into())]));
 
             let result = service
                 .exec_query("SELECT sum(dec_value), sum(dec_value_1) / 10 from foo.values where dec_value_1 < '10'")
                 .await
                 .unwrap();
 
-            assert_eq!(result.get_rows()[0], Row::new(vec![TableValue::Decimal("-132.99".to_string()), TableValue::Float(0.45.into())]));
+            assert_eq!(result.get_rows()[0], Row::new(vec![TableValue::Decimal(Decimal::new(-13299000)), TableValue::Float(0.45.into())]));
         })
             .await;
     }
@@ -1310,7 +1405,9 @@ mod tests {
 
     #[tokio::test]
     async fn high_frequency_inserts_gcs() {
-        if env::var("SERVICE_ACCOUNT_JSON").is_err() {
+        if env::var("SERVICE_ACCOUNT_JSON").is_err()
+            && env::var("CUBESTORE_GCP_SERVICE_ACCOUNT_JSON").is_err()
+        {
             return;
         }
         Config::test("high_frequency_inserts_gcs")

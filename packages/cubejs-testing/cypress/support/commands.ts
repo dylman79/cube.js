@@ -27,11 +27,13 @@
 // Cypress.Commands.overwrite("visit", (originalFn, url, options) => { ... })
 
 Cypress.Commands.add('getByTestId', (selector, ...args) => {
-  return cy.get(`[data-testid=${selector}]`, ...args);
+  return cy.get(`[data-testid='${selector}']`, ...args);
 });
 
 Cypress.Commands.add('setQuery', (query, ...args) => {
+  cy.clearLocalStorage('queryTabs');
   cy.visit(`/#/build?query=${JSON.stringify(query)}`, ...args);
+  cy.wait(100);
 });
 
 Cypress.Commands.add('setChartType', (chartType) => {
@@ -44,17 +46,19 @@ Cypress.Commands.add('runQuery', () => {
   // cy.intercept('get', '/cubejs-api/v1/load').as('load');
   // cy.wait(['@load']);
 
-  cy.getByTestId('run-query-btn', { timeout: 5 * 1000 }).should('be.visible').click();
+  cy.getByTestId('run-query-btn', { timeout: 5 * 1000 })
+    .should('be.visible')
+    .click();
   cy.getByTestId('cube-loader', { timeout: 10 * 1000 }).should('not.exist');
   cy.wait(100);
 });
 
 Cypress.Commands.add('addMeasure', (name) => {
   cy.getByTestId('Measure').click();
-  cy.get('body').contains(name).click();
+  cy.getByTestId(name).click();
 });
 
 Cypress.Commands.add('addDimension', (name) => {
   cy.getByTestId('Dimension').click();
-  cy.get('body').contains(name).click();
+  cy.getByTestId(name).click();
 });

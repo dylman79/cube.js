@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import LRUCache from 'lru-cache';
+import { MaybeCancelablePromise } from '@cubejs-backend/shared';
 
 import { QueryQueue } from './QueryQueue';
 import { ContinueWaitError } from './ContinueWaitError';
@@ -7,6 +8,7 @@ import { RedisCacheDriver } from './RedisCacheDriver';
 import { LocalCacheDriver } from './LocalCacheDriver';
 import { CacheDriverInterface } from './cache-driver.interface';
 import { DriverFactory, DriverFactoryByDataSource } from './DriverFactory';
+import { BaseDriver } from '../driver';
 
 type QueryWithParams = [string, any[]] | string;
 type Query = {
@@ -43,6 +45,7 @@ export class QueryCache {
       continueWaitTimeout?: number;
       cacheAndQueueDriver?: 'redis' | 'memory';
       maxInMemoryCacheEntries?: number;
+      skipExternalCacheAndQueue?: boolean;
     } = {}
   ) {
     this.cacheDriver = options.cacheAndQueueDriver === 'redis' ?
@@ -75,7 +78,7 @@ export class QueryCache {
 
     const expireSecs = this.getExpireSecs(queryBody);
 
-    if (!cacheKeyQueries) {
+    if (!cacheKeyQueries || queryBody.external && this.options.skipExternalCacheAndQueue) {
       return {
         data: await this.queryWithRetryAndRelease(query, values, {
           cacheKey: [query, values],
@@ -201,8 +204,7 @@ export class QueryCache {
     });
   }
 
-  public getQueue(dataSource: string) {
-    dataSource = dataSource || 'default';
+  public getQueue(dataSource: string = 'default') {
     if (!this.queue[dataSource]) {
       this.queue[dataSource] = QueryCache.createQueue(
         `SQL_QUERY_${this.redisPrefix}_${dataSource}`,
@@ -245,6 +247,7 @@ export class QueryCache {
           redisPool: this.options.redisPool,
           // Centralized continueWaitTimeout that can be overridden in queueOptions
           continueWaitTimeout: this.options.continueWaitTimeout,
+          skipQueue: this.options.skipExternalCacheAndQueue,
           ...this.options.externalQueueOptions
         }
       );
@@ -252,8 +255,12 @@ export class QueryCache {
     return this.externalQueue;
   }
 
-  public static createQueue(redisPrefix, clientFactory: DriverFactory, executeFn, options) {
-    options = options || {};
+  public static createQueue(
+    redisPrefix: string,
+    clientFactory: DriverFactory,
+    executeFn: (client: BaseDriver, q: any) => any,
+    options: Record<string, any> = {}
+  ): QueryQueue {
     const queue: any = new QueryQueue(redisPrefix, {
       queryHandlers: {
         query: async (q, setCancelHandle) => {
@@ -384,6 +391,12 @@ export class QueryCache {
       },
     ));
   }
+
+  public withLock = <T = any>(
+    key: string,
+    ttl: number,
+    callback: () => MaybeCancelablePromise<T>,
+  ) => this.cacheDriver.withLock(`lock:${key}`, callback, ttl, true);
 
   public async cacheQueryResult(query, values, cacheKey, expiration, options: {
     renewalThreshold?: number,

@@ -6,10 +6,11 @@ import { ResultSet } from '@cubejs-client/core';
 import { useHotkeys } from 'react-hotkeys-hook';
 import type { PivotConfig, Query, ChartType } from '@cubejs-client/core';
 
-import { Button, CubeLoader } from '../../atoms';
+import { Button, CubeLoader, FatalError } from '../../atoms';
 import { UIFramework } from '../../types';
 import { event } from '../../events';
-import { QueryStatus } from '../../PlaygroundQueryBuilder';
+import { useAppContext } from '../AppContext';
+import { QueryStatus } from "../PlaygroundQueryBuilder/components/PlaygroundQueryBuilder";
 
 const { Text } = Typography;
 
@@ -72,7 +73,8 @@ export type TQueryLoadResult = {
   error?: Error | null;
 } & Partial<QueryStatus>;
 
-type TChartRendererProps = {
+type ChartRendererProps = {
+  queryId: string;
   query: Query;
   queryError: Error | null;
   isQueryLoading: boolean;
@@ -86,10 +88,10 @@ type TChartRendererProps = {
   onQueryStatusChange: (result: TQueryLoadResult) => void;
   onChartRendererReadyChange: (isReady: boolean) => void;
   onRunButtonClick: () => void;
-  onQueryChange: () => void;
 };
 
 export default function ChartRenderer({
+  queryId,
   areQueriesEqual,
   queryError,
   iframeRef,
@@ -100,13 +102,14 @@ export default function ChartRenderer({
   onChartRendererReadyChange,
   onQueryStatusChange,
   onRunButtonClick,
-  onQueryChange,
-}: TChartRendererProps) {
+}: ChartRendererProps) {
   const runButtonRef = useRef<HTMLButtonElement>(null);
   const [slowQuery, setSlowQuery] = useState(false);
   const [resultSetExists, setResultSet] = useState(false);
   const [slowQueryFromCache, setSlowQueryFromCache] = useState(false);
   const [isPreAggregationBuildInProgress, setBuildInProgress] = useState(false);
+
+  const { extDbType } = useAppContext();
 
   // for you, ovr :)
   useHotkeys('cmd+enter', () => {
@@ -119,10 +122,6 @@ export default function ChartRenderer({
     };
     // eslint-disable-next-line
   }, []);
-
-  useEffect(() => {
-    onQueryChange();
-  }, [areQueriesEqual]);
 
   useEffect(() => {
     setResultSet(false);
@@ -139,21 +138,26 @@ export default function ChartRenderer({
       onQueryLoad: ({ resultSet, error }: TQueryLoadResult) => {
         let isAggregated;
         const timeElapsed = Date.now() - queryStartTime;
+
         if (resultSet) {
           const { loadResponse } = resultSet.serialize();
+          const { external, dbType, usedPreAggregations = {} } = loadResponse.results[0] || {};
 
           setSlowQueryFromCache(Boolean(loadResponse.slowQuery));
           Boolean(loadResponse.slowQuery) && setSlowQuery(false);
           setResultSet(true);
 
-          isAggregated =
-            Object.keys(loadResponse.results[0]?.usedPreAggregations || {})
-              .length > 0;
+          isAggregated = Object.keys(usedPreAggregations).length > 0;
 
           event(
             isAggregated
               ? 'load_request_success_aggregated:frontend'
-              : 'load_request_success:frontend'
+              : 'load_request_success:frontend',
+            {
+              dbType,
+              ...(isAggregated ? { external } : null),
+              ...(external ? { extDbType } : null),
+            }
           );
         }
 
@@ -186,7 +190,6 @@ export default function ChartRenderer({
   }, [framework, onChartRendererReadyChange]);
 
   const loading: boolean =
-    !isChartRendererReady ||
     queryHasMissingMembers ||
     isQueryLoading ||
     isPreAggregationBuildInProgress;
@@ -202,7 +205,7 @@ export default function ChartRenderer({
 
   const renderExtras = () => {
     if (queryError) {
-      return <div>{queryError?.toString()}</div>;
+      return <FatalError error={queryError} />;
     }
 
     if (queryHasMissingMembers) {
@@ -243,7 +246,7 @@ export default function ChartRenderer({
               ref={runButtonRef}
               size="large"
               type="primary"
-              loading={isQueryLoading}
+              loading={!isChartRendererReady}
               icon={<PlaySquareOutlined />}
               onClick={onRunButtonClick}
             >
@@ -277,6 +280,7 @@ export default function ChartRenderer({
 
       <ChartContainer invisible={invisible}>
         <iframe
+          id={`iframe-${queryId}`}
           data-testid="chart-renderer"
           ref={iframeRef}
           title="Chart renderer"

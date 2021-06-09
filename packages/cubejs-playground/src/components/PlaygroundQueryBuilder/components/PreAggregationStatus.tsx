@@ -1,14 +1,12 @@
 import styled from 'styled-components';
-import { Space, Typography } from 'antd';
+import { Alert, Button, Modal, Space, Typography } from 'antd';
+import { useState } from 'react';
 import Icon from '@ant-design/icons';
 
-import { formatNumber } from '../../../utils';
 import { LightningIcon } from '../../../shared/icons/LightningIcon';
-
-type PreAggregationStatusProps = {
-  timeElapsed: number;
-  isAggregated: boolean;
-};
+import { PreAggregationHelper } from './PreAggregationHelper';
+import { useAppContext } from '../../AppContext';
+import { QueryStatus } from "./PlaygroundQueryBuilder";
 
 const Badge = styled.div`
   display: flex;
@@ -18,44 +16,66 @@ const Badge = styled.div`
   background: var(--warning-bg-color);
 `;
 
+type PreAggregationStatusProps = QueryStatus;
+
 export function PreAggregationStatus({
-  timeElapsed,
   isAggregated,
+  transformedQuery,
+  external,
 }: PreAggregationStatusProps) {
-  const renderTime = () => (
-    <Typography.Text strong style={{ color: 'rgba(20, 20, 70, 0.85)' }}>
-      {formatNumber(timeElapsed)} ms
-    </Typography.Text>
-  );
+  const { extDbType } = useAppContext();
+  const [isModalOpen, setIsModalOpen] = useState<boolean>(false);
+  // hide it for the time being
+  // const renderTime = () => (
+  //   <Typography.Text strong style={{ color: 'rgba(20, 20, 70, 0.85)' }}>
+  //     {formatNumber(timeElapsed)} ms
+  //   </Typography.Text>
+  // );
 
   return (
-    <Space style={{ marginLeft: 'auto' }}>
-      {isAggregated ? (
-        <Badge>
-          <Space size={4}>
-            <Icon
-              style={{ color: 'var(--warning-color)' }}
-              component={() => <LightningIcon />}
-            />
-            {renderTime()}
-          </Space>
-        </Badge>
-      ) : (
-        renderTime()
-      )}
+    <>
+      <Space style={{ marginLeft: 'auto' }}>
+        {isAggregated && (
+          <Badge>
+            <Space size={4}>
+              <Icon
+                style={{ color: 'var(--warning-color)' }}
+                component={() => <LightningIcon />}
+              />
+            </Space>
+          </Badge>
+        )}
 
-      {isAggregated ? (
-        <Typography.Text>
-          Query was accelerated with pre-aggregation
-        </Typography.Text>
-      ) : (
-        <Typography.Link
-          href="https://cube.dev/docs/caching/pre-aggregations/getting-started"
-          target="_blank"
-        >
-          Query was not accelerated with pre-aggregation {'->'}
-        </Typography.Link>
-      )}
-    </Space>
+        {isAggregated ? (
+          <Typography.Text>
+            Query was accelerated with pre-aggregation
+          </Typography.Text>
+        ) : (
+          <Button type="link" onClick={() => setIsModalOpen(true)}>
+            Query was not accelerated with pre-aggregation {'->'}
+          </Button>
+        )}
+
+        {external && extDbType !== 'cubestore' ? (
+          <Alert message="Consider migrating your pre-aggregations to Cube Store for better performance with larger datasets" type="warning" />
+        ) : null}
+      </Space>
+
+      <Modal
+        title="Pre-aggregation"
+        visible={isModalOpen}
+        footer={null}
+        bodyStyle={{
+          paddingTop: 16,
+        }}
+        onCancel={() => {
+          setIsModalOpen(false);
+        }}
+      >
+        {transformedQuery ? (
+          <PreAggregationHelper transformedQuery={transformedQuery} />
+        ) : null}
+      </Modal>
+    </>
   );
 }
