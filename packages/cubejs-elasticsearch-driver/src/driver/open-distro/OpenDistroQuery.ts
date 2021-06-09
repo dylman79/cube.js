@@ -72,10 +72,7 @@ export class OpenDistroQuery extends BaseQuery {
             typeof a === 'string' && typeof b === 'string' && a.toUpperCase() === b.toUpperCase()
         );
 
-        let field;
-
-        field = this.dimensionsForSelect().find((d: any) => equalIgnoreCase(d.dimension, id));
-
+        let field = this.dimensionsForSelect().find((d: any) => equalIgnoreCase(d.dimension, id));
         if (field) {
             return field.dimensionSql();
         }
