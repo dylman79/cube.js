@@ -5,7 +5,7 @@ import {ElasticSearchQueryFormat} from "../ElasticSearchQueryFormat";
 
 export class AggregationQueryHandler implements ElasticSearchQueryHandler {
 
-    constructor(private client: Client, private format: ElasticSearchQueryFormat, private rowField: string = 'rows', private columnField: string = 'columns') {
+    constructor(private client: Client, private format: ElasticSearchQueryFormat) {
         // none (defaults to jdbc) for elastic co and json for open distro
         if (!['json', 'jdbc'].includes(this.format)) {
             throw new Error('Unsupported format');
@@ -21,11 +21,19 @@ export class AggregationQueryHandler implements ElasticSearchQueryHandler {
             }
         });
 
-        if (!response?.body?.aggregations) {
+        if (!response?.body) {
             throw new Error('Invalid Response');
         }
 
-        return this.traverseAggregations(response.body.aggregations);
+        if (response.body.aggregations) {
+            return this.traverseAggregations(response.body.aggregations);
+        }
+        console.log( response.body?.hits?.hits);
+        const hits: any[] = response.body?.hits?.hits;
+        if (!hits) {
+            return [];
+        }
+        return hits.map(hit => hit._source);
     }
 
     private traverseAggregations(aggregations: any) {
