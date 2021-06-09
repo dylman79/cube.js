@@ -16,17 +16,19 @@ export class WellFormattedQueryHandler implements ElasticSearchQueryHandler {
         let cursor = null;
         let result = null;
         do {
-            const response = await this.client.sql.query({
+            const response: any = await this.client.sql.query({
                 format: this.format,
                 body: {
-                    query: SqlString.format(query, values)
+                    query: SqlString.format(query, values),
+                    cursor: cursor || undefined
                 }
             });
 
             if (!response?.body) {
                 throw new Error('Invalid Response');
             }
-            cursor = response.body.cursor || null;
+            console.log(response?.body);
+            cursor = response.body.cursor || undefined;
 
             result = this.transform(response.body, result);
 
