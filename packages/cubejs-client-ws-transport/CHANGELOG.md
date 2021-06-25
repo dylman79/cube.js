@@ -3,6 +3,38 @@
 All notable changes to this project will be documented in this file.
 See [Conventional Commits](https://conventionalcommits.org) for commit guidelines.
 
+## [0.27.41](https://github.com/cube-js/cube.js/compare/v0.27.40...v0.27.41) (2021-06-25)
+
+**Note:** Version bump only for package @cubejs-client/ws-transport
+
+
+
+
+
+## [0.27.35](https://github.com/cube-js/cube.js/compare/v0.27.34...v0.27.35) (2021-06-18)
+
+**Note:** Version bump only for package @cubejs-client/ws-transport
+
+
+
+
+
+## [0.27.32](https://github.com/cube-js/cube.js/compare/v0.27.31...v0.27.32) (2021-06-12)
+
+**Note:** Version bump only for package @cubejs-client/ws-transport
+
+
+
+
+
+## [0.27.31](https://github.com/cube-js/cube.js/compare/v0.27.30...v0.27.31) (2021-06-11)
+
+**Note:** Version bump only for package @cubejs-client/ws-transport
+
+
+
+
+
 ## [0.27.26](https://github.com/cube-js/cube.js/compare/v0.27.25...v0.27.26) (2021-06-01)
 
 **Note:** Version bump only for package @cubejs-client/ws-transport

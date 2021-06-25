@@ -1,16 +1,23 @@
-import { RefObject, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import {
+  RefObject,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from 'react';
 import { Alert, Typography } from 'antd';
 import { PlaySquareOutlined } from '@ant-design/icons';
 import styled from 'styled-components';
+import type { ChartType, PivotConfig, Query } from '@cubejs-client/core';
 import { ResultSet } from '@cubejs-client/core';
 import { useHotkeys } from 'react-hotkeys-hook';
-import type { PivotConfig, Query, ChartType } from '@cubejs-client/core';
+import { CubeContext } from '@cubejs-client/react';
 
 import { Button, CubeLoader, FatalError } from '../../atoms';
 import { UIFramework } from '../../types';
 import { event } from '../../events';
-import { useAppContext } from '../AppContext';
-import { QueryStatus } from "../PlaygroundQueryBuilder/components/PlaygroundQueryBuilder";
+import { QueryStatus } from '../PlaygroundQueryBuilder/components/PlaygroundQueryBuilder';
 
 const { Text } = Typography;
 
@@ -67,7 +74,7 @@ const Wrapper = styled.div`
   text-align: center;
 `;
 
-export type TQueryLoadResult = {
+export type QueryLoadResult = {
   isLoading: boolean;
   resultSet?: ResultSet;
   error?: Error | null;
@@ -85,9 +92,9 @@ type ChartRendererProps = {
   pivotConfig?: PivotConfig;
   iframeRef: RefObject<HTMLIFrameElement>;
   framework: UIFramework;
-  onQueryStatusChange: (result: TQueryLoadResult) => void;
+  onQueryStatusChange: (result: QueryLoadResult) => void;
   onChartRendererReadyChange: (isReady: boolean) => void;
-  onRunButtonClick: () => void;
+  onRunButtonClick: () => Promise<void>;
 };
 
 export default function ChartRenderer({
@@ -103,13 +110,14 @@ export default function ChartRenderer({
   onQueryStatusChange,
   onRunButtonClick,
 }: ChartRendererProps) {
+  const { cubejsApi } = useContext(CubeContext);
+
   const runButtonRef = useRef<HTMLButtonElement>(null);
+  const [isTokenRefreshing, setTokenRefreshing] = useState<boolean>(false);
   const [slowQuery, setSlowQuery] = useState(false);
   const [resultSetExists, setResultSet] = useState(false);
   const [slowQueryFromCache, setSlowQueryFromCache] = useState(false);
   const [isPreAggregationBuildInProgress, setBuildInProgress] = useState(false);
-
-  const { extDbType } = useAppContext();
 
   // for you, ovr :)
   useHotkeys('cmd+enter', () => {
@@ -135,13 +143,18 @@ export default function ChartRenderer({
         queryStartTime = Date.now();
         onQueryStatusChange({ isLoading: true });
       },
-      onQueryLoad: ({ resultSet, error }: TQueryLoadResult) => {
+      onQueryLoad: ({ resultSet, error }: QueryLoadResult) => {
         let isAggregated;
         const timeElapsed = Date.now() - queryStartTime;
 
         if (resultSet) {
           const { loadResponse } = resultSet.serialize();
-          const { external, dbType, usedPreAggregations = {} } = loadResponse.results[0] || {};
+          const {
+            external,
+            dbType,
+            extDbType,
+            usedPreAggregations = {},
+          } = loadResponse.results[0] || {};
 
           setSlowQueryFromCache(Boolean(loadResponse.slowQuery));
           Boolean(loadResponse.slowQuery) && setSlowQuery(false);
@@ -167,7 +180,7 @@ export default function ChartRenderer({
             error,
             isLoading: false,
             timeElapsed,
-            isAggregated
+            isAggregated,
           });
         }
       },
@@ -187,12 +200,13 @@ export default function ChartRenderer({
         onChartRendererReadyChange(true);
       },
     };
-  }, [framework, onChartRendererReadyChange]);
+  }, [framework]);
 
   const loading: boolean =
     queryHasMissingMembers ||
     isQueryLoading ||
-    isPreAggregationBuildInProgress;
+    isPreAggregationBuildInProgress ||
+    !cubejsApi;
 
   const invisible: boolean =
     !isChartRendererReady ||
@@ -246,9 +260,13 @@ export default function ChartRenderer({
               ref={runButtonRef}
               size="large"
               type="primary"
-              loading={!isChartRendererReady}
+              loading={!isChartRendererReady || isTokenRefreshing}
               icon={<PlaySquareOutlined />}
-              onClick={onRunButtonClick}
+              onClick={async () => {
+                setTokenRefreshing(true);
+                await onRunButtonClick();
+                setTokenRefreshing(false);
+              }}
             >
               Run
             </Button>
@@ -279,13 +297,15 @@ export default function ChartRenderer({
       {renderExtras()}
 
       <ChartContainer invisible={invisible}>
-        <iframe
-          id={`iframe-${queryId}`}
-          data-testid="chart-renderer"
-          ref={iframeRef}
-          title="Chart renderer"
-          src={`/chart-renderers/${framework}/index.html`}
-        />
+        {cubejsApi ? (
+          <iframe
+            id={`iframe-${queryId}`}
+            data-testid="chart-renderer"
+            ref={iframeRef}
+            title="Chart renderer"
+            src={`/chart-renderers/${framework}/index.html`}
+          />
+        ) : null}
       </ChartContainer>
     </>
   );

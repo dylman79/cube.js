@@ -139,6 +139,13 @@ declare module '@cubejs-client/core' {
     sortedTimeDimensions: [[string, string]];
   };
 
+  export type PreAggregationType = 'rollup' | 'rollupJoin' | 'originalSql';
+
+  type UsedPreAggregation = {
+    targetTableName: string;
+    type: PreAggregationType;
+  }
+
   type LoadResponseResult<T> = {
     annotation: QueryAnnotations;
     lastRefreshTime: string;
@@ -146,7 +153,8 @@ declare module '@cubejs-client/core' {
     data: T[];
     external: boolean | null;
     dbType: string;
-    usedPreAggregations?: Record<string, any>;
+    extDbType: string;
+    usedPreAggregations?: Record<string, UsedPreAggregation>;
     transformedQuery?: TransformedQuery;
   };
 
@@ -802,14 +810,14 @@ declare module '@cubejs-client/core' {
 
   type TCubeMemberType = 'time' | 'number' | 'string' | 'boolean';
 
-  type TCubeMember = {
+  export type TCubeMember = {
     type: TCubeMemberType;
     name: string;
     title: string;
     shortTitle: string;
   };
 
-  type TCubeMeasure = TCubeMember & {
+  export type TCubeMeasure = TCubeMember & {
     aggType: 'count' | 'number';
     cumulative: boolean;
     cumulativeTotal: boolean;
@@ -820,11 +828,11 @@ declare module '@cubejs-client/core' {
     };
   };
 
-  type TCubeDimension = TCubeMember & {
+  export type TCubeDimension = TCubeMember & {
     suggestFilterValues: boolean;
   };
 
-  type TCubeSegment = Pick<TCubeMember, 'name' | 'shortTitle' | 'title'>;
+  export type TCubeSegment = Pick<TCubeMember, 'name' | 'shortTitle' | 'title'>;
 
   type TCubeMemberByType<T> = T extends 'measures'
     ? TCubeMeasure

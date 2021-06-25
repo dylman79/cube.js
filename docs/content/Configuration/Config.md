@@ -35,7 +35,7 @@ interface CubejsConfiguration {
   contextToOrchestratorId: (context: RequestContext) => string;
   repositoryFactory: (context: RequestContext) => SchemaFileRepository;
   checkAuth: (req: ExpressRequest, authorization: string) => any;
-  queryTransformer: (query: object, context: RequestContext) => object;
+  queryRewrite: (query: object, context: RequestContext) => object;
   preAggregationsSchema: string | ((context: RequestContext) => string);
   schemaVersion: (context: RequestContext) => string;
   scheduledRefreshTimer: boolean | number;
@@ -70,6 +70,7 @@ interface CubejsConfiguration {
   },
   externalDbType: string | ((context: RequestContext) => string);
   externalDriverFactory: (context: RequestContext) => BaseDriver | Promise<BaseDriver>;
+  cacheAndQueueDriver: 'memory' | 'redis';
   orchestratorOptions: OrchestratorOptions | ((context: RequestContext) => OrchestratorOptions);
   allowJsDuplicatePropsInSchema: boolean;
 }
@@ -262,7 +263,12 @@ module.exports = {
 };
 ```
 
-### queryTransformer
+### queryRewrite
+
+<!-- prettier-ignore-start -->
+[[warning | Note]]
+| In previous versions of Cube.js, this was called `queryTransformer`.
+<!-- prettier-ignore-end -->
 
 This is a security hook to check your query just before it gets processed. You
 can use this very generic API to implement any type of custom security checks
@@ -270,12 +276,12 @@ your app needs and transform input query accordingly.
 
 Called on each request.
 
-For example you can use `queryTransformer` to add row level security filter
+For example you can use `queryRewrite` to add row level security filter
 where needed.
 
 ```javascript
 module.exports = {
-  queryTransformer: (query, { securityContext }) => {
+  queryRewrite: (query, { securityContext }) => {
     if (securityContext.filterByRegion) {
       query.filters.push({
         member: 'Regions.id',
@@ -576,6 +582,11 @@ module.exports = {
     }),
 };
 ```
+
+### cacheAndQueueDriver
+
+The cache and queue driver to use for the Cube.js deployment. Defaults to
+`memory` in development, `redis` in production.
 
 ### orchestratorOptions
 

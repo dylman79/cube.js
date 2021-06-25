@@ -16,9 +16,21 @@ import {
 } from '@cubejs-backend/shared';
 
 import type { Application as ExpressApplication } from 'express';
-import type { BaseDriver } from '@cubejs-backend/query-orchestrator';
+import type { BaseDriver, DriverFactoryByDataSource } from '@cubejs-backend/query-orchestrator';
 import type { Constructor, Required } from '@cubejs-backend/shared';
 import type { CubeStoreDevDriver, CubeStoreHandler, isCubeStoreSupported } from '@cubejs-backend/cubestore-driver';
+
+import { FileRepository, SchemaFileRepository } from './FileRepository';
+import { RefreshScheduler, ScheduledRefreshOptions } from './RefreshScheduler';
+import { OrchestratorApi, OrchestratorApiOptions } from './OrchestratorApi';
+import { CompilerApi } from './CompilerApi';
+import { DevServer } from './DevServer';
+import agentCollect from './agentCollect';
+import { OrchestratorStorage } from './OrchestratorStorage';
+import { prodLogger, devLogger } from './logger';
+import DriverDependencies from './DriverDependencies';
+import optionsValidate from './optionsValidate';
+
 import type {
   ContextToAppIdFn,
   CreateOptions,
@@ -30,43 +42,16 @@ import type {
   RequestContext,
   DriverContext,
   LoggerFn,
+  SystemOptions
 } from './types';
-
-import { FileRepository, SchemaFileRepository } from './FileRepository';
-import { RefreshScheduler, ScheduledRefreshOptions } from './RefreshScheduler';
-import { OrchestratorApi } from './OrchestratorApi';
-import { CompilerApi } from './CompilerApi';
-import { DevServer } from './DevServer';
-import agentCollect from './agentCollect';
-import { OrchestratorStorage } from './OrchestratorStorage';
-import { prodLogger, devLogger } from './logger';
-
-import DriverDependencies from './DriverDependencies';
-import optionsValidate from './optionsValidate';
+import { ContextToOrchestratorIdFn } from './types';
 
 const { version } = require('../../../package.json');
-
-const checkEnvForPlaceholders = () => {
-  const placeholderSubstr = '<YOUR_DB_';
-  const credentials = [
-    'CUBEJS_DB_HOST',
-    'CUBEJS_DB_NAME',
-    'CUBEJS_DB_USER',
-    'CUBEJS_DB_PASS'
-  ];
-  if (
-    credentials.find((credential) => (
-      process.env[credential] && process.env[credential].indexOf(placeholderSubstr) === 0
-    ))
-  ) {
-    throw new Error('Your .env file contains placeholders in DB credentials. Please replace them with your DB credentials.');
-  }
-};
 
 export type ServerCoreInitializedOptions = Required<
   CreateOptions,
   // This fields are required, because we add default values in constructor
-  'dbType' | 'apiSecret' | 'devServer' | 'telemetry' | 'logger' | 'dashboardAppPath' | 'dashboardAppPort' |
+  'dbType' | 'apiSecret' | 'devServer' | 'telemetry' | 'dashboardAppPath' | 'dashboardAppPort' |
   'driverFactory' | 'dialectFactory' |
   'externalDriverFactory' | 'externalDialectFactory' |
   'scheduledRefreshContexts'
@@ -95,13 +80,13 @@ export class CubejsServerCore {
 
   protected compilerCache: LRUCache<string, CompilerApi>;
 
-  protected contextToOrchestratorId: any;
+  protected readonly contextToOrchestratorId: ContextToOrchestratorIdFn;
 
   protected readonly preAggregationsSchema: PreAggregationsSchemaFn;
 
   protected readonly orchestratorOptions: OrchestratorOptionsFn;
 
-  public logger: (type: string, params: Record<string, any>) => void;
+  public logger: LoggerFn;
 
   protected preAgentLogger: any;
 
@@ -127,10 +112,16 @@ export class CubejsServerCore {
 
   public coreServerVersion: string|null = null;
 
-  public constructor(opts: CreateOptions = {}) {
+  public constructor(opts: CreateOptions = {}, protected readonly systemOptions?: SystemOptions) {
+    optionsValidate(opts);
+
+    this.logger = opts.logger || (
+      process.env.NODE_ENV !== 'production'
+        ? devLogger(process.env.CUBEJS_LOG_LEVEL)
+        : prodLogger(process.env.CUBEJS_LOG_LEVEL)
+    );
     this.options = this.handleConfiguration(opts);
 
-    this.logger = this.options.logger;
     this.repository = new FileRepository(this.options.schemaPath);
     this.repositoryFactory = this.options.repositoryFactory || (() => this.repository);
 
@@ -208,14 +199,15 @@ export class CubejsServerCore {
 
     this.initAgent();
 
-    if (this.options.devServer && !this.configFileExists()) {
+    if (this.options.devServer && !this.isReadyForQueryProcessing()) {
       this.event('first_server_start');
     }
 
     if (this.options.devServer) {
       this.devServer = new DevServer(this, {
         dockerVersion: getEnv('dockerImageVersion'),
-        externalDbTypeFn: this.contextToExternalDbType
+        externalDbTypeFn: this.contextToExternalDbType,
+        isReadyForQueryProcessing: this.isReadyForQueryProcessing.bind(this)
       });
       const oldLogger = this.logger;
       this.logger = ((msg, params) => {
@@ -258,12 +250,15 @@ export class CubejsServerCore {
   }
 
   protected isReadyForQueryProcessing(): boolean {
-    const dbType = this.options.dbType || <DatabaseType | undefined>process.env.CUBEJS_DB_TYPE;
-
-    return typeof dbType !== 'undefined';
+    return (
+      Boolean(process.env.CUBEJS_DB_HOST) ||
+      Boolean(process.env.CUBEJS_DB_BQ_PROJECT_ID) ||
+      this.systemOptions?.isCubeConfigEmpty === undefined ||
+      !this.systemOptions?.isCubeConfigEmpty
+    );
   }
 
-  public startScheduledRefreshTimer(): [boolean, string|null] {
+  public startScheduledRefreshTimer(): [boolean, string | null] {
     if (!this.isReadyForQueryProcessing()) {
       return [false, 'Instance is not ready for query processing, refresh scheduler is disabled'];
     }
@@ -304,8 +299,6 @@ export class CubejsServerCore {
   });
 
   protected handleConfiguration(opts: CreateOptions): ServerCoreInitializedOptions {
-    optionsValidate(opts);
-
     const skipOnEnv = [
       // Default EXT_DB variables
       'CUBEJS_EXT_DB_URL',
@@ -324,17 +317,11 @@ export class CubejsServerCore {
     const definedExtDBVariables = skipOnEnv.filter((field) => process.env[field] !== undefined);
 
     const externalDbType = opts.externalDbType ||
-      <DatabaseType|undefined>process.env.CUBEJS_EXT_DB_TYPE ||
+      <DatabaseType | undefined>process.env.CUBEJS_EXT_DB_TYPE ||
       (getEnv('devMode') || definedExtDBVariables.length > 0) && 'cubestore' ||
       undefined;
 
     const devServer = process.env.NODE_ENV !== 'production' || getEnv('devMode');
-    const logger: LoggerFn = opts.logger || (
-      process.env.NODE_ENV !== 'production'
-        ? devLogger(process.env.CUBEJS_LOG_LEVEL)
-        : prodLogger(process.env.CUBEJS_LOG_LEVEL)
-    );
-
     let externalDriverFactory = externalDbType && (
       () => new (CubejsServerCore.lookupDriverClass(externalDbType))({
         url: process.env.CUBEJS_EXT_DB_URL,
@@ -367,7 +354,7 @@ export class CubejsServerCore {
             stderr: (data) => {
               console.log(data.toString().trim());
             },
-            onRestart: (code) => logger('Cube Store Restarting', {
+            onRestart: (code) => this.logger('Cube Store Restarting', {
               warning: `Instance exit with ${code}, restarting`,
             }),
           });
@@ -387,7 +374,7 @@ export class CubejsServerCore {
           externalDriverFactory = () => new cubeStorePackage.CubeStoreDevDriver(cubeStoreHandler);
           externalDialectFactory = () => cubeStorePackage.CubeStoreDevDriver.dialectClass();
         } else {
-          logger('Cube Store is not supported on your system', {
+          this.logger('Cube Store is not supported on your system', {
             warning: (
               `You are using ${process.platform} platform with ${process.arch} architecture, ` +
               'which is not supported by Cube Store.'
@@ -427,7 +414,6 @@ export class CubejsServerCore {
         devServer ? 'dev_pre_aggregations' : 'prod_pre_aggregations'
       ),
       schemaPath: process.env.CUBEJS_SCHEMA_PATH || 'schema',
-      logger,
       scheduledRefreshTimer: getEnv('scheduledRefresh') !== undefined ? getEnv('scheduledRefresh') : getEnv('refreshTimer'),
       sqlCache: true,
       livePreview: getEnv('livePreview'),
@@ -445,7 +431,7 @@ export class CubejsServerCore {
     };
 
     if (opts.contextToAppId && !opts.scheduledRefreshContexts) {
-      options.logger('Multitenancy Without ScheduledRefreshContexts', {
+      this.logger('Multitenancy Without ScheduledRefreshContexts', {
         warning: (
           'You are using multitenancy without configuring scheduledRefreshContexts, which can lead to issues where the ' +
           'security context will be undefined while Cube.js will do background refreshing: ' +
@@ -463,7 +449,7 @@ export class CubejsServerCore {
     }
 
     // Create schema directory to protect error on new project with dev mode (docker flow)
-    if (options.devServer && !this.configFileExists()) {
+    if (options.devServer) {
       const repositoryPath = path.join(process.cwd(), options.schemaPath);
 
       if (!fs.existsSync(repositoryPath)) {
@@ -471,7 +457,7 @@ export class CubejsServerCore {
       }
     }
 
-    if (!options.devServer || this.configFileExists()) {
+    if (!options.devServer || this.isReadyForQueryProcessing()) {
       const fieldsForValidation: (keyof ServerCoreInitializedOptions)[] = [
         'driverFactory',
         'dbType'
@@ -494,15 +480,14 @@ export class CubejsServerCore {
   }
 
   protected reloadEnvVariables() {
-    this.options.dbType = this.options.dbType || <DatabaseType | undefined>process.env.CUBEJS_DB_TYPE;
-    this.options.externalDbType = this.options.externalDbType || <DatabaseType|undefined>process.env.CUBEJS_EXT_DB_TYPE;
+    // `CUBEJS_DB_TYPE` has priority because the dbType can change in the Connection Wizard
+    this.options.dbType = <DatabaseType | undefined>process.env.CUBEJS_DB_TYPE || this.options.dbType;
+    this.options.externalDbType = this.options.externalDbType
+      || <DatabaseType | undefined>process.env.CUBEJS_EXT_DB_TYPE;
 
+    this.driver = null;
     this.contextToDbType = wrapToFnIfNeeded(this.options.dbType);
     this.contextToExternalDbType = wrapToFnIfNeeded(this.options.externalDbType);
-  }
-
-  public configFileExists(): boolean {
-    return (Boolean(process.env.CUBEJS_DB_TYPE) || fs.existsSync('./cube.js'));
   }
 
   protected detectScheduledRefreshTimer(scheduledRefreshTimer: number | boolean): number | false {
@@ -545,13 +530,11 @@ export class CubejsServerCore {
     }
   }
 
-  public static create(options?: CreateOptions) {
-    return new CubejsServerCore(options);
+  public static create(options?: CreateOptions, systemOptions?: SystemOptions) {
+    return new CubejsServerCore(options, systemOptions);
   }
 
   public async initApp(app: ExpressApplication) {
-    checkEnvForPlaceholders();
-
     const apiGateway = this.apiGateway();
     apiGateway.initApp(app);
 
@@ -566,8 +549,6 @@ export class CubejsServerCore {
   }
 
   public initSubscriptionServer(sendMessage) {
-    checkEnvForPlaceholders();
-
     const apiGateway = this.apiGateway();
     return apiGateway.initSubscriptionServer(sendMessage);
   }
@@ -588,13 +569,13 @@ export class CubejsServerCore {
         basePath: this.options.basePath,
         checkAuthMiddleware: this.options.checkAuthMiddleware,
         checkAuth: this.options.checkAuth,
-        queryTransformer: this.options.queryTransformer,
+        queryRewrite: this.options.queryRewrite || this.options.queryTransformer,
         extendContext: this.options.extendContext,
         playgroundAuthSecret: getEnv('playgroundAuthSecret'),
         jwt: this.options.jwt,
         refreshScheduler: () => new RefreshScheduler(this),
         scheduledRefreshContexts: this.options.scheduledRefreshContexts,
-        scheduledRefreshTimeZones: this.options.scheduledRefreshTimeZones
+        scheduledRefreshTimeZones: this.options.scheduledRefreshTimeZones,
       }
     );
   }
@@ -649,8 +630,8 @@ export class CubejsServerCore {
 
     const externalDbType = this.contextToExternalDbType(context);
 
-    const orchestratorApi = this.createOrchestratorApi({
-      getDriver: async (dataSource = 'default') => {
+    const orchestratorApi = this.createOrchestratorApi(
+      async (dataSource = 'default') => {
         if (driverPromise[dataSource]) {
           return driverPromise[dataSource];
         }
@@ -679,43 +660,46 @@ export class CubejsServerCore {
           }
         })();
       },
-      getExternalDriverFactory: this.options.externalDriverFactory && (async () => {
-        if (externalPreAggregationsDriverPromise) {
-          return externalPreAggregationsDriverPromise;
-        }
-
-        // eslint-disable-next-line no-return-assign
-        return externalPreAggregationsDriverPromise = (async () => {
-          let driver: BaseDriver|null = null;
-
-          try {
-            driver = await this.options.externalDriverFactory(context);
-            if (driver.setLogger) {
-              driver.setLogger(this.logger);
-            }
-
-            await driver.testConnection();
-
-            return driver;
-          } catch (e) {
-            externalPreAggregationsDriverPromise = null;
-
-            if (driver) {
-              await driver.release();
-            }
-
-            throw e;
+      {
+        externalDriverFactory: this.options.externalDriverFactory && (async () => {
+          if (externalPreAggregationsDriverPromise) {
+            return externalPreAggregationsDriverPromise;
           }
-        })();
-      }),
-      redisPrefix: orchestratorId,
-      orchestratorOptions: {
+
+          // eslint-disable-next-line no-return-assign
+          return externalPreAggregationsDriverPromise = (async () => {
+            let driver: BaseDriver|null = null;
+
+            try {
+              driver = await this.options.externalDriverFactory(context);
+              if (driver.setLogger) {
+                driver.setLogger(this.logger);
+              }
+
+              await driver.testConnection();
+
+              return driver;
+            } catch (e) {
+              externalPreAggregationsDriverPromise = null;
+
+              if (driver) {
+                await driver.release();
+              }
+
+              throw e;
+            }
+          })();
+        }),
+        contextToDbType: this.contextToDbType.bind(this),
+        contextToExternalDbType: this.contextToExternalDbType.bind(this),
+        redisPrefix: orchestratorId,
         skipExternalCacheAndQueue: externalDbType === 'cubestore',
+        cacheAndQueueDriver: this.options.cacheAndQueueDriver,
         ...this.options.orchestratorOptions,
         // OrchestratorOptionsFn should have an ability to override static configuration form cube.js file
         ...this.orchestratorOptions(context),
       }
-    });
+    );
 
     this.orchestratorStorage.set(orchestratorId, orchestratorApi);
 
@@ -739,16 +723,14 @@ export class CubejsServerCore {
     });
   }
 
-  protected createOrchestratorApi(options: any = {}): OrchestratorApi {
+  protected createOrchestratorApi(
+    getDriver: DriverFactoryByDataSource,
+    options: OrchestratorApiOptions
+  ): OrchestratorApi {
     return new OrchestratorApi(
-      options.getDriver || this.getDriver.bind(this),
+      getDriver,
       this.logger,
-      {
-        redisPrefix: options.redisPrefix || process.env.CUBEJS_APP,
-        externalDriverFactory: options.getExternalDriverFactory,
-        ...options.orchestratorOptions,
-        contextToDbType: this.contextToDbType.bind(this)
-      }
+      options
     );
   }
 
@@ -833,8 +815,6 @@ export class CubejsServerCore {
   }
 
   public static createDriver(dbType: DatabaseType): BaseDriver {
-    checkEnvForPlaceholders();
-
     return new (CubejsServerCore.lookupDriverClass(dbType))();
   }
 

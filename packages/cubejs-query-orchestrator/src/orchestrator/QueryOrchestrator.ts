@@ -4,11 +4,13 @@ import { getEnv } from '@cubejs-backend/shared';
 import { QueryCache } from './QueryCache';
 import { PreAggregations } from './PreAggregations';
 import { RedisPool, RedisPoolOptions } from './RedisPool';
-import { DriverFactoryByDataSource } from './DriverFactory';
+import { DriverFactory, DriverFactoryByDataSource } from './DriverFactory';
 
-interface QueryOrchestratorOptions {
-  cacheAndQueueDriver?: 'redis' | 'memory';
-  externalDriverFactory?: any;
+export type CacheAndQueryDriverType = 'redis' | 'memory';
+
+export interface QueryOrchestratorOptions {
+  externalDriverFactory?: DriverFactory;
+  cacheAndQueueDriver?: CacheAndQueryDriverType;
   redisPoolOptions?: RedisPoolOptions;
   queryCacheOptions?: any;
   preAggregationsOptions?: any;
@@ -24,13 +26,11 @@ export class QueryOrchestrator {
 
   protected readonly redisPool: RedisPool|undefined;
 
-  protected readonly driverFactory: DriverFactoryByDataSource;
-
   protected readonly rollupOnlyMode: boolean;
 
   public constructor(
     protected readonly redisPrefix: string,
-    driverFactory: DriverFactoryByDataSource,
+    protected readonly driverFactory: DriverFactoryByDataSource,
     protected readonly logger: any,
     options: QueryOrchestratorOptions = {}
   ) {
@@ -49,11 +49,9 @@ export class QueryOrchestrator {
     const redisPool = cacheAndQueueDriver === 'redis' ? new RedisPool(options.redisPoolOptions) : undefined;
     const { externalDriverFactory, continueWaitTimeout, skipExternalCacheAndQueue } = options;
 
-    this.driverFactory = driverFactory;
-
     this.queryCache = new QueryCache(
       this.redisPrefix,
-      this.driverFactory,
+      driverFactory,
       this.logger,
       {
         externalDriverFactory,
@@ -167,25 +165,15 @@ export class QueryOrchestrator {
     preAggregationsSchema: string,
     requestId: string,
   ) {
-    const preAggregationsByUniqueSource = preAggregations.reduce((obj, p) => {
-      const { dataSource, external } = p.preAggregation;
-      const key = JSON.stringify({ dataSource, external });
-      if (!obj.set.has(key)) {
-        obj.set.add(key);
-        obj.array.push(p.preAggregation);
-      }
-      return obj;
-    }, { set: new Set(), array: [] });
-
-    const versionEntries = await Promise.all(
-      preAggregationsByUniqueSource.array
-        .map(p => this.preAggregations.getPreAggregationVersionEntries(
-          {
-            ...p.preAggregation,
-            preAggregationsSchema
-          },
-          requestId
-        ))
+    const versionEntries = await this.preAggregations.getVersionEntries(
+      preAggregations.map(p => {
+        const { preAggregation } = p.preAggregation;
+        const partition = p.partitions[0];
+        preAggregation.dataSource = (partition && partition.dataSource) || 'default';
+        preAggregation.preAggregationsSchema = preAggregationsSchema;
+        return preAggregation;
+      }),
+      requestId
     );
 
     const flatFn = (arrResult: any[], arrItem: any[]) => ([...arrResult, ...arrItem]);
@@ -193,7 +181,7 @@ export class QueryOrchestrator {
       .map(p => p.partitions)
       .reduce(flatFn, [])
       .reduce((obj, partition) => {
-        obj[partition.sql.tableName] = partition;
+        if (partition && partition.sql) obj[partition.sql.tableName] = partition;
         return obj;
       }, {});
 
@@ -203,5 +191,23 @@ export class QueryOrchestrator {
         const partition = partitionsByTableName[versionEntry.table_name];
         return partition && versionEntry.structure_version === PreAggregations.structureVersion(partition.sql);
       });
+  }
+
+  public async getPreAggregationPreview(requestId, preAggregation, versionEntry) {
+    const targetTableName = PreAggregations.targetTableName(versionEntry);
+    const querySql = preAggregation.sql && QueryCache.replacePreAggregationTableNames(
+      preAggregation.sql.previewSql,
+      [[preAggregation.sql.tableName, { targetTableName }]]
+    );
+    const query = querySql && querySql[0];
+    const data = query && await this.fetchQuery({
+      continueWait: true,
+      external: preAggregation.external,
+      dataSource: preAggregation.dataSource,
+      query,
+      requestId
+    });
+
+    return data || [];
   }
 }

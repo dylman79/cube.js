@@ -15,6 +15,7 @@ context('Playground: Connection Wizard', () => {
       req.reply((res) => {
         res.body = {
           ...res.body,
+          isDocker: true,
           shouldStartConnectionWizardFlow,
         };
       });
@@ -91,6 +92,7 @@ context('Playground: Connection Wizard', () => {
     it('executes a query after a successful connection', () => {
       shouldStartConnectionWizardFlow = false;
       cy.setQuery(eventsCountQuery);
+      cy.wait(300);
       cy.setChartType('number');
       cy.runQuery();
       cy.getByTestId('chart-renderer')

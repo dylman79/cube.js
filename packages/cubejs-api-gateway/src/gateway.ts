@@ -17,12 +17,19 @@ import { UserError } from './UserError';
 import { CubejsHandlerError } from './CubejsHandlerError';
 import { SubscriptionServer, WebSocketSendMessageFn } from './SubscriptionServer';
 import { LocalSubscriptionStore } from './LocalSubscriptionStore';
-import { getPivotQuery, getQueryGranularity, normalizeQuery, normalizeQueryPreAggregations, QUERY_TYPE } from './query';
+import {
+  getPivotQuery,
+  getQueryGranularity,
+  normalizeQuery,
+  normalizeQueryPreAggregations,
+  normalizeQueryPreAggregationPreview,
+  QUERY_TYPE
+} from './query';
 import {
   CheckAuthFn,
   CheckAuthMiddlewareFn,
   ExtendContextFn,
-  QueryTransformerFn,
+  QueryRewriteFn,
   RequestContext,
   RequestLoggerMiddlewareFn,
   Request,
@@ -179,7 +186,7 @@ export interface ApiGatewayOptions {
   checkAuthMiddleware?: CheckAuthMiddlewareFn;
   jwt?: JWTOptions;
   requestLoggerMiddleware?: RequestLoggerMiddlewareFn;
-  queryTransformer?: QueryTransformerFn;
+  queryRewrite?: QueryRewriteFn;
   subscriptionStore?: any;
   enforceSecurityChecks?: boolean;
   playgroundAuthSecret?: string;
@@ -194,7 +201,7 @@ export class ApiGateway {
 
   protected readonly basePath: string;
 
-  protected readonly queryTransformer: QueryTransformerFn;
+  protected readonly queryRewrite: QueryRewriteFn;
 
   protected readonly subscriptionStore: any;
 
@@ -225,7 +232,7 @@ export class ApiGateway {
     protected readonly compilerApi: any,
     protected readonly adapterApi: any,
     protected readonly logger: any,
-    options: ApiGatewayOptions,
+    protected readonly options: ApiGatewayOptions,
   ) {
     this.dataSourceStorage = options.dataSourceStorage;
     this.refreshScheduler = options.refreshScheduler;
@@ -235,7 +242,7 @@ export class ApiGateway {
     this.basePath = options.basePath;
     this.playgroundAuthSecret = options.playgroundAuthSecret;
 
-    this.queryTransformer = options.queryTransformer || (async (query) => query);
+    this.queryRewrite = options.queryRewrite || (async (query) => query);
     this.subscriptionStore = options.subscriptionStore || new LocalSubscriptionStore();
     this.enforceSecurityChecks = options.enforceSecurityChecks || (process.env.NODE_ENV === 'production');
     this.extendContext = options.extendContext;
@@ -346,8 +353,8 @@ export class ApiGateway {
         const contexts = this.scheduledRefreshContexts ? await this.scheduledRefreshContexts() : [];
         this.resToResultFn(res)({
           securityContexts: contexts
-            .filter(c => c && c.securityContext)
-            .map(context => context.securityContext)
+            .map(ctx => ctx && (ctx.securityContext || ctx.authInfo))
+            .filter(ctx => ctx)
         });
       }));
 
@@ -359,6 +366,14 @@ export class ApiGateway {
 
       app.post('/cubejs-system/v1/pre-aggregations/partitions', jsonParser, systemMiddlewares, (async (req, res) => {
         await this.getPreAggregationPartitions({
+          query: req.body.query,
+          context: req.context,
+          res: this.resToResultFn(res)
+        });
+      }));
+
+      app.post('/cubejs-system/v1/pre-aggregations/preview', jsonParser, systemMiddlewares, (async (req, res) => {
+        await this.getPreAggregationPreview({
           query: req.body.query,
           context: req.context,
           res: this.resToResultFn(res)
@@ -462,7 +477,7 @@ export class ApiGateway {
           ...props,
           preAggregation,
           partitions: partitions.map(partition => {
-            partition.versionEntries = preAggregationVersionEntriesByName[partition.sql.tableName];
+            partition.versionEntries = preAggregationVersionEntriesByName[partition.sql?.tableName] || [];
             return partition;
           }),
         });
@@ -470,6 +485,43 @@ export class ApiGateway {
 
       res({
         preAggregationPartitions: preAggregationPartitions.map(mergePartitionsAndVersionEntries())
+      });
+    } catch (e) {
+      this.handleError({
+        e, context, res, requestStarted
+      });
+    }
+  }
+
+  public async getPreAggregationPreview(
+    { query, context, res }: { query: any, context: RequestContext, res: ResponseResultFn }
+  ) {
+    const requestStarted = new Date();
+    try {
+      query = normalizeQueryPreAggregationPreview(this.parseQueryParam(query));
+      const { preAggregationId, refreshRange, versionEntry, timezone } = query;
+
+      const orchestratorApi = this.getAdapterApi(context);
+      const compilerApi = this.getCompilerApi(context);
+
+      const preAggregationPartitions = await this.refreshScheduler()
+        .preAggregationPartitions(
+          context,
+          compilerApi,
+          {
+            timezones: [timezone],
+            preAggregations: [{ id: preAggregationId, refreshRange }]
+          }
+        );
+      const { partitions } = (preAggregationPartitions && preAggregationPartitions[0] || {});
+      const preAggregationPartition = partitions && partitions.find(p => p.sql?.tableName === versionEntry.table_name);
+
+      res({
+        preview: preAggregationPartition && await orchestratorApi.getPreAggregationPreview(
+          context,
+          preAggregationPartition,
+          query.versionEntry
+        )
       });
     } catch (e) {
       this.handleError({
@@ -493,7 +545,7 @@ export class ApiGateway {
 
     const queries = Array.isArray(query) ? query : [query];
     const normalizedQueries = await Promise.all(
-      queries.map((currentQuery) => this.queryTransformer(normalizeQuery(currentQuery), context))
+      queries.map((currentQuery) => this.queryRewrite(normalizeQuery(currentQuery), context))
     );
 
     if (normalizedQueries.find((currentQuery) => !currentQuery)) {
@@ -706,6 +758,7 @@ export class ApiGateway {
           annotation,
           dataSource: response.dataSource,
           dbType: response.dbType,
+          extDbType: response.extDbType,
           external: response.external,
           slowQuery: Boolean(response.slowQuery)
         };
@@ -714,7 +767,9 @@ export class ApiGateway {
       this.log({
         type: 'Load Request Success',
         query,
-        duration: this.duration(requestStarted)
+        duration: this.duration(requestStarted),
+        queriesWithPreAggregations: results.filter((r: any) => Object.keys(r.usedPreAggregations || {}).length).length,
+        queriesWithData: results.filter((r: any) => r.data?.length).length
       }, context);
 
       if (queryType !== QUERY_TYPE.REGULAR_QUERY && props.queryType == null) {
